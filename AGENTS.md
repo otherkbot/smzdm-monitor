@@ -2,9 +2,19 @@
 
 This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-10-11`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
 
+## WeCom Push and Keyword Alerts (2026-10-17)
+
+This section supersedes the WXPusher-specific wording elsewhere in this file (send acceptance, recipient keyword cooldown, `summary`/`url`/HTML `copy` details).
+
+- Push channel: WeCom (企业微信) self-built app, `msgtype: news`, one article per deal. Env: `WECOM_CORPID`, `WECOM_AGENTID`, `WECOM_SECRET`, `WECOM_TOUSER` (default `@all`, multiple users separated by `|`). `access_token` comes from `cgi-bin/gettoken`, is cached for the run, and is refreshed once when `message/send` returns `40001`/`40014`/`42001`. Only `errcode == 0` (integer) is success; it enters `history` with `msgid` stored in `send_record_id`. Other errcodes, malformed JSON, HTTP errors, and token failures never enter history. POST timeouts are unknown outcomes and are not retried. `enable_duplicate_check` (1800 s) is set as a guard against stale-cache duplicates. Never log the secret or access token.
+- Article mapping: title = display price + short title (`[关键词:X] ¥price short title` for keyword alerts), clipped to 128 UTF-8 bytes; description = existing `_build_notification_summary` first line + mall/publish time + votes/comments/collection/path (keyword alerts: price/conditions/threshold, short title, mall/time, "未经热度筛选"), clipped to 512 bytes; `url` = validated SMZDM link, falling back to `https://www.smzdm.com/p/{id}/`; `picurl` = validated `article_pic`. `_build_notification_content` (HTML) is retained but not sent.
+- `DRY_RUN=1` logs the full payload, makes no WeCom request, and writes no history.
+- The WXPusher recipient keyword cooldown is dormant: nothing writes new rows, but the table, the read path, late-recheck exclusion, and cleanup remain for cache compatibility. The recipient key is SHA-256 of `corpid:agentid:touser`.
+- Keyword low-price alerts: rules from `SMZDM_KEYWORDS` (non-empty wins) or `keywords.json`; spec `kw[|alias...]:max_price,...`. Titles are matched after NFKC, lowercasing, and stripping whitespace/punctuation. Sources: every main-feed/rank row, plus one `https://api.smzdm.com/v1/list?keyword=...&limit=50` query per keyword/alias per run (hard cap 10 requests, 12-hour age window, `faxian`/`youhui` only). A match is pushed when the parsed price is `<=` the threshold and the deal is active and not a task title. It bypasses stage-1, trend, comment, and shill filters. Unparseable prices are never pushed. Dedupe uses DB history ID plus SKU/fingerprint (`_is_send_duplicate`, not run-local `seen_ids`), and pushes one item per keyword+price per run. Keyword-pushed IDs are skipped by the hot loop; the hot (热度) logic is otherwise unchanged.
+
 ## Project Overview
 
-This repository contains a single-run SMZDM (什么值得买) deal monitor. It scans deal feeds, evaluates engagement quality and growth, performs limited comment-sample checks, deduplicates accepted products in SQLite, and sends WXPusher HTML notifications.
+This repository contains a single-run SMZDM (什么值得买) deal monitor. It scans deal feeds, evaluates engagement quality and growth, performs limited comment-sample checks, deduplicates accepted products in SQLite, and sends WeCom (企业微信) image-text `news` notifications, plus keyword low-price alerts.
 
 The main design constraint is asymmetric data quality: list engagement fields are broadly available, while full comment-level distributions and JD store/self-operated fields are not reliably available from GitHub Actions. Do not turn unavailable external data into a hard rejection unless the user explicitly changes that policy.
 
@@ -16,7 +26,8 @@ Install and run:
 
 ```bash
 pip install -r requirements.txt
-WXPUSHER_APP_TOKEN=xxx WXPUSHER_UID=xxx python3 smzdm.py
+WECOM_CORPID=ww... WECOM_AGENTID=1000003 WECOM_SECRET=xxx python3 smzdm.py
+DRY_RUN=1 SMZDM_DB_PATH=/tmp/dry.db python3 smzdm.py  # log payloads only
 ```
 
 Run the test suite:
@@ -36,7 +47,8 @@ The script performs one scan, sends any accepted deals, and exits. Scheduling be
 - `smzdm.py`: application code, configuration, SQLite schema, filtering, network access, and notification formatting.
 - `test_smzdm.py`: unit tests for feed handling, title filters, quality paths, trends, comments, deduplication, and push logs.
 - `test_trends_titles.py`, `test_notification_format.py`, `test_push_delivery.py`: focused tests for article isolation/title protection, notification display, and recipient delivery-result handling.
-- `test_push_keyword_cooldown.py`, `test_comment_evidence.py`, `test_comment_anomalies.py`: focused tests for recipient keyword cooldowns, independent grade evidence/concentration gates, and comment parsing/anomaly observations.
+- `test_keyword_alerts.py`: keyword rule parsing/matching, price thresholds, dedupe, keyword search, and WeCom payload byte limits. `keywords.json`: default keyword rules.
+- `test_push_keyword_cooldown.py`, `test_comment_evidence.py`, `test_comment_anomalies.py`: focused tests for dormant legacy recipient keyword cooldowns, independent grade evidence/concentration gates, and comment parsing/anomaly observations.
 - `.github/workflows/smzdm.yml`: GitHub Actions runner and SQLite cache handling.
 - `README.md`: current user-facing behavior and deployment documentation.
 - `analysis/`: dated historical log reviews. A dated report is evidence from that point in time, not current configuration.

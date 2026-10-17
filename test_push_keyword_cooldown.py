@@ -12,18 +12,26 @@ from smzdm import CONFIG, SmzdmScraper
 
 
 class PushKeywordCooldownTests(unittest.TestCase):
+    """旧 WXPusher 冷却状态保持兼容：企业微信不会写入新冷却，但旧缓存行仍被尊重直至过期。"""
+
     def setUp(self):
         self.patches = ExitStack()
         self.addCleanup(self.patches.close)
         self.patches.enter_context(patch('smzdm.DB_PATH', ':memory:'))
-        self.patches.enter_context(patch('smzdm.APP_TOKEN', 'AT_private_token'))
-        self.patches.enter_context(patch('smzdm.UID', 'UID_private_recipient'))
+        self.patches.enter_context(patch('smzdm.WECOM_CORPID', 'ww_private_corp'))
+        self.patches.enter_context(patch('smzdm.WECOM_AGENTID', '1000003'))
+        self.patches.enter_context(patch('smzdm.WECOM_SECRET', 'SECRET_private_value'))
+        self.patches.enter_context(patch('smzdm.WECOM_TOUSER', '@all'))
+        self.patches.enter_context(patch('smzdm.DRY_RUN', False))
         self.post = self.patches.enter_context(patch('smzdm.requests.post'))
         self.post.return_value.status_code = 200
+        get = self.patches.enter_context(patch('smzdm.requests.get'))
+        get.return_value.status_code = 200
+        get.return_value.json.return_value = {'errcode': 0, 'access_token': 'TOKEN_private'}
         self.scraper = SmzdmScraper()
+        self.scraper.keyword_rules = []
         self.addCleanup(self.scraper._cleanup)
-        self.scraper._build_notification_content = Mock(return_value='<p>测试商品</p>')
-        self.scraper._build_notification_summary = Mock(return_value='¥19.9 测试商品')
+        self.scraper._build_notification_summary = Mock(return_value='19.9元 测试商品')
         self.data = {
             'id': '183743621', 'title': '极空间 NAS 测试商品',
             'fingerprint': 'nas-model', 'mall': '京东',
@@ -33,60 +41,19 @@ class PushKeywordCooldownTests(unittest.TestCase):
         }
 
     @staticmethod
-    def rejected_result():
-        return {
-            'success': True, 'code': 1000,
-            'data': [{
-                'uid': 'UID_private_recipient', 'code': 1001,
-                'status': '微信用户[UID=UID_private_recipient]因为用户设置的关键字过滤，不发送。'
-                          '请引导用户在【我的订阅】-【设置过滤关键字】修改。',
-            }],
-        }
+    def expected_recipient_key(touser='@all'):
+        return hashlib.sha256(f'ww_private_corp:1000003:{touser}'.encode('utf-8')).hexdigest()
 
-    def test_explicit_target_keyword_rejection_is_separate_from_history_and_post_failures(self):
-        self.post.return_value.json.return_value = self.rejected_result()
-        with self.assertLogs(level='INFO') as logs:
-            self.assertFalse(self.scraper._send_notification(self.data))
-            self.assertFalse(self.scraper._send_notification(self.data))
-        self.post.assert_called_once()
-        self.assertEqual(self.scraper.stats['total_push_failed'], 0)
-        self.assertEqual(self.scraper.stats['total_push_keyword_filtered'], 1)
-        self.assertEqual(self.scraper.stats['total_push_keyword_cooldown_skipped'], 1)
-        self.assertEqual(self.scraper.conn.execute('SELECT COUNT(*) FROM history').fetchone()[0], 0)
-        self.assertNotIn(self.data['id'], self.scraper.seen_ids)
-        row = self.scraper.conn.execute(
-            'SELECT recipient_key, article_id, expires_at FROM push_keyword_cooldowns'
-        ).fetchone()
-        self.assertEqual(row[0], hashlib.sha256(b'UID_private_recipient').hexdigest())
-        self.assertEqual(row[1], self.data['id'])
-        expires_at = datetime.fromisoformat(row[2])
-        self.assertGreater(expires_at, datetime.utcnow() + timedelta(minutes=44))
-        self.assertLessEqual(expires_at, datetime.utcnow() + timedelta(minutes=45))
-        message = '\n'.join(logs.output)
-        self.assertNotIn('UID_private_recipient', message)
-        self.assertNotIn('AT_private_token', message)
-        self.assertIn('关键词冷却跳过', message)
-        self.assertIn('接收人code:1001', message)
-        self.assertIn('sendRecordId:-', message)
-        self.assertFalse(any(':ERROR:' in entry for entry in logs.output))
-
-    def test_unverified_results_and_other_failures_never_create_cooldown(self):
-        matching = self.rejected_result()['data'][0]
-        cases = [
-            {'success': False, 'code': 1000, 'data': [matching]},
-            {'success': True, 'code': 1001, 'data': [matching]},
-            {'success': True, 'code': 1000, 'data': [matching, matching]},
-            {'success': True, 'code': 1000, 'data': [{**matching, 'uid': 'UID_someone_else'}]},
-            {'success': True, 'code': 1000, 'data': [{**matching, 'code': 1002}]},
-            {'success': True, 'code': 1000, 'data': [{**matching, 'status': '接收人失败'}]},
-            {'success': True, 'code': 1000, 'data': [{**matching, 'status': '请检查关键字设置'}]},
-            {'success': True, 'code': 1000, 'data': [{**matching, 'status': None}]},
-            {'success': True, 'code': 1000, 'msg': matching['status'], 'data': []},
-        ]
-        for result in cases:
+    def test_wecom_failures_never_create_cooldown(self):
+        """企业微信没有 WXPusher 式的接收人关键词拒绝；任何失败都只计为推送失败。"""
+        for result in (
+            {'errcode': 81013, 'errmsg': 'user & party & tag all invalid'},
+            {'errcode': 45009, 'errmsg': 'api freq out of limit'},
+            {'errcode': 0, 'errmsg': 'ok', 'invaliduser': 'someone'},
+        ):
             with self.subTest(result=result):
                 self.post.return_value.json.return_value = result
-                self.assertFalse(self.scraper._send_notification(self.data))
+                self.scraper._send_notification(dict(self.data))
                 self.assertFalse(self.scraper._is_push_keyword_cooling_down(self.data['id']))
         self.post.side_effect = requests.ReadTimeout('unknown POST outcome')
         self.assertFalse(self.scraper._send_notification(self.data))
@@ -95,21 +62,29 @@ class PushKeywordCooldownTests(unittest.TestCase):
         self.assertEqual(self.scraper.conn.execute(
             'SELECT COUNT(*) FROM push_keyword_cooldowns').fetchone()[0], 0)
 
+    def test_legacy_cooldown_row_still_blocks_send_and_stores_only_hash(self):
+        self.scraper._save_push_keyword_cooldown(self.data['id'])
+        row = self.scraper.conn.execute(
+            'SELECT recipient_key, article_id FROM push_keyword_cooldowns').fetchone()
+        self.assertEqual(row, (self.expected_recipient_key(), self.data['id']))
+        with self.assertLogs(level='INFO') as logs:
+            self.assertFalse(self.scraper._send_notification(self.data))
+        self.post.assert_not_called()
+        self.assertIn('关键词冷却跳过', '\n'.join(logs.output))
+        self.assertEqual(self.scraper.stats['total_push_failed'], 0)
+
     def test_cooldown_is_scoped_to_recipient_and_article_and_expiry_allows_retry(self):
         self.scraper._save_push_keyword_cooldown(self.data['id'])
         self.assertTrue(self.scraper._is_push_keyword_cooling_down(self.data['id']))
         self.assertFalse(self.scraper._is_push_keyword_cooling_down('different-article'))
-        with patch('smzdm.UID', 'UID_another_recipient'):
+        with patch('smzdm.WECOM_TOUSER', 'another_user'):
             self.assertFalse(self.scraper._is_push_keyword_cooling_down(self.data['id']))
         self.scraper.conn.execute(
             'UPDATE push_keyword_cooldowns SET expires_at = ?',
             (datetime.utcnow().isoformat(timespec='seconds'),),
         )
         self.assertFalse(self.scraper._is_push_keyword_cooling_down(self.data['id']))
-        self.post.return_value.json.return_value = {
-            'success': True, 'code': 1000,
-            'data': [{'uid': 'UID_private_recipient', 'code': 1000, 'sendRecordId': 12313}],
-        }
+        self.post.return_value.json.return_value = {'errcode': 0, 'errmsg': 'ok', 'msgid': 'MSG1'}
         self.assertTrue(self.scraper._send_notification(self.data))
         self.post.assert_called_once()
         self.assertEqual(self.scraper.stats['total_push_keyword_cooldown_skipped'], 0)
@@ -135,6 +110,7 @@ class PushKeywordCooldownTests(unittest.TestCase):
         with ExitStack() as mocks:
             mocks.enter_context(patch.object(
                 self.scraper, '_scan_and_filter_stage1', return_value=[self.data]))
+            mocks.enter_context(patch.object(self.scraper, '_search_keyword_deals'))
             mocks.enter_context(patch.object(self.scraper, '_enrich_candidates_from_channel_apis'))
             mocks.enter_context(patch.object(self.scraper, '_cleanup'))
             mocks.enter_context(patch.object(self.scraper, '_print_statistics'))

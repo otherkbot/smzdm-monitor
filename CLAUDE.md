@@ -2,9 +2,19 @@
 
 This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-10-11`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
 
+## WeCom Push and Keyword Alerts (2026-10-17)
+
+This section supersedes the WXPusher-specific wording elsewhere in this file (send acceptance, recipient keyword cooldown, `summary`/`url`/HTML `copy` details).
+
+- Push channel: WeCom (企业微信) self-built app, `msgtype: news`, one article per deal. Env: `WECOM_CORPID`, `WECOM_AGENTID`, `WECOM_SECRET`, `WECOM_TOUSER` (default `@all`, multiple users separated by `|`). `access_token` comes from `cgi-bin/gettoken`, is cached for the run, and is refreshed once when `message/send` returns `40001`/`40014`/`42001`. Only `errcode == 0` (integer) is success; it enters `history` with `msgid` stored in `send_record_id`. Other errcodes, malformed JSON, HTTP errors, and token failures never enter history. POST timeouts are unknown outcomes and are not retried. `enable_duplicate_check` (1800 s) is set as a guard against stale-cache duplicates. Never log the secret or access token.
+- Article mapping: title = display price + short title (`[关键词:X] ¥price short title` for keyword alerts), clipped to 128 UTF-8 bytes; description = existing `_build_notification_summary` first line + mall/publish time + votes/comments/collection/path (keyword alerts: price/conditions/threshold, short title, mall/time, "未经热度筛选"), clipped to 512 bytes; `url` = validated SMZDM link, falling back to `https://www.smzdm.com/p/{id}/`; `picurl` = validated `article_pic`. `_build_notification_content` (HTML) is retained but not sent.
+- `DRY_RUN=1` logs the full payload, makes no WeCom request, and writes no history.
+- The WXPusher recipient keyword cooldown is dormant: nothing writes new rows, but the table, the read path, late-recheck exclusion, and cleanup remain for cache compatibility. The recipient key is SHA-256 of `corpid:agentid:touser`.
+- Keyword low-price alerts: rules from `SMZDM_KEYWORDS` (non-empty wins) or `keywords.json`; spec `kw[|alias...]:max_price,...`. Titles are matched after NFKC, lowercasing, and stripping whitespace/punctuation. Sources: every main-feed/rank row, plus one `https://api.smzdm.com/v1/list?keyword=...&limit=50` query per keyword/alias per run (hard cap 10 requests, 12-hour age window, `faxian`/`youhui` only). A match is pushed when the parsed price is `<=` the threshold and the deal is active and not a task title. It bypasses stage-1, trend, comment, and shill filters. Unparseable prices are never pushed. Dedupe uses DB history ID plus SKU/fingerprint (`_is_send_duplicate`, not run-local `seen_ids`), and pushes one item per keyword+price per run. Keyword-pushed IDs are skipped by the hot loop; the hot (热度) logic is otherwise unchanged.
+
 ## Project
 
-SMZDM (什么值得买) deal monitor. `smzdm.py` performs one scan, filters candidates, sends accepted deals through WXPusher, saves state in SQLite, and exits. Scheduling is external; there is no local polling loop.
+SMZDM (什么值得买) deal monitor. `smzdm.py` performs one scan, filters candidates, sends accepted deals through WeCom (企业微信) `news` messages, sends keyword low-price alerts, saves state in SQLite, and exits. Scheduling is external; there is no local polling loop.
 
 The project deliberately treats list engagement and snapshot growth as its primary evidence. SMZDM does not expose a reliable complete distribution of comment-user levels through the endpoint available to GitHub Actions, and JD store/self-operated fields are also unreliable on hosted runners. Missing external data is diagnostic rather than a default rejection.
 
@@ -14,7 +24,8 @@ Keep discovery broad. The user wants price, product, purchase conditions, and a 
 
 ```bash
 pip install -r requirements.txt
-WXPUSHER_APP_TOKEN=xxx WXPUSHER_UID=xxx python3 smzdm.py
+WECOM_CORPID=ww... WECOM_AGENTID=1000003 WECOM_SECRET=xxx python3 smzdm.py
+DRY_RUN=1 SMZDM_DB_PATH=/tmp/dry.db python3 smzdm.py  # log payloads only
 python3 -m unittest -v
 ```
 

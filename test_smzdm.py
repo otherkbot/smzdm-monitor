@@ -188,14 +188,19 @@ class SmzdmFilterTests(unittest.TestCase):
         self.assertFalse(scraper._should_defer_for_comment_unavailable(data))
         self.assertEqual(scraper.stats["total_comment_level_undercovered_skipped"], 1)
 
-    @patch("smzdm.UID", "UID_test")
+    @patch("smzdm.WECOM_CORPID", "ww_test_corp")
+    @patch("smzdm.WECOM_AGENTID", "1000003")
+    @patch("smzdm.WECOM_SECRET", "SECRET_test")
+    @patch("smzdm.WECOM_TOUSER", "@all")
+    @patch("smzdm.requests.get")
     @patch("smzdm.requests.post")
-    def test_successful_push_logs_review_fields(self, mock_post):
-        mock_post.return_value.status_code = 200
-        mock_post.return_value.json.return_value = {
-            "success": True, "code": 1000,
-            "data": [{"uid": "UID_test", "code": 1000, "sendRecordId": 12313}],
+    def test_successful_push_logs_review_fields(self, mock_post, mock_get):
+        mock_get.return_value.status_code = 200
+        mock_get.return_value.json.return_value = {
+            "errcode": 0, "errmsg": "ok", "access_token": "TOKEN_test", "expires_in": 7200,
         }
+        mock_post.return_value.status_code = 200
+        mock_post.return_value.json.return_value = {"errcode": 0, "errmsg": "ok", "msgid": "MSG_test"}
         self.scraper.stats = {"total_push_failed": 0, "total_push_unknown": 0}
         data = {
             "id": "178999999",

@@ -1,0 +1,7 @@
+{
+  "_comment": "关键词低价提醒：标题命中任一关键词/别名（忽略大小写、空格和标点）且解析价格 <= max_price 元时立即推送，不经过热度筛选；每篇文章只推一次。环境变量 SMZDM_KEYWORDS 非空时覆盖本文件，格式：好奇号:155,京东plus会员|京东plus年卡:80",
+  "keywords": [
+    {"keyword": "好奇号", "max_price": 155},
+    {"keyword": "京东plus会员", "aliases": ["京东plus年卡"], "max_price": 80}
+  ]
+}

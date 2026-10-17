@@ -47,13 +47,15 @@ jobs:
         if: ${{ inputs.debug_article_id != '' }}
         env:
           DEBUG_ARTICLE_ID: ${{ inputs.debug_article_id }}
-          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          WECOM_CORPID: ${{ secrets.WECOM_CORPID }}
+          WECOM_AGENTID: ${{ secrets.WECOM_AGENTID }}
+          WECOM_TOUSER: ${{ vars.WECOM_TOUSER || '@all' }}
         run: |
           if [[ ! "$DEBUG_ARTICLE_ID" =~ ^[0-9]+$ ]]; then
             echo "debug_article_id must contain digits only"
             exit 1
           fi
-          # 诊断在 scraper 之前执行，先兼容旧缓存的表结构，包含关键词冷却表。
+          # 诊断在 scraper 之前执行，先兼容旧缓存的表结构，包含旧关键词冷却表。
           python - <<'PY'
           from smzdm import SmzdmScraper
           scraper = SmzdmScraper()
@@ -125,8 +127,13 @@ jobs:
 
       - name: Run scraper
         env:
-          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
-          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          WECOM_CORPID: ${{ secrets.WECOM_CORPID }}
+          WECOM_AGENTID: ${{ secrets.WECOM_AGENTID }}
+          WECOM_SECRET: ${{ secrets.WECOM_SECRET }}
+          WECOM_TOUSER: ${{ vars.WECOM_TOUSER || '@all' }}
+          # 留空则使用仓库内 keywords.json；格式：好奇号:155,京东plus会员|京东plus年卡:80
+          SMZDM_KEYWORDS: ${{ vars.SMZDM_KEYWORDS }}
+          DRY_RUN: ${{ vars.DRY_RUN }}
         run: python smzdm.py
 
       # 保存 SQLite 数据库到缓存 (无论成功失败都保存，以便保留进度)

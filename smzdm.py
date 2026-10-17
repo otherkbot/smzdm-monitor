@@ -22,8 +22,20 @@ from urllib3.util.retry import Retry
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 # ===== 配置 =====
-APP_TOKEN = os.environ.get("WXPUSHER_APP_TOKEN", "")
-UID = os.environ.get("WXPUSHER_UID", "")
+# 企业微信自建应用推送（图文 news 消息，点击直接打开 SMZDM 原文）
+WECOM_CORPID = os.environ.get("WECOM_CORPID", "").strip()
+WECOM_AGENTID = os.environ.get("WECOM_AGENTID", "").strip()
+WECOM_SECRET = os.environ.get("WECOM_SECRET", "").strip()
+WECOM_TOUSER = os.environ.get("WECOM_TOUSER", "").strip() or "@all"
+WECOM_API_BASE = "https://qyapi.weixin.qq.com/cgi-bin"
+# 仅记录将要发送的载荷，不请求企业微信、不写入推送历史
+DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes", "on")
+# 关键词低价提醒：环境变量优先，其次仓库内 keywords.json
+SMZDM_KEYWORDS = os.environ.get("SMZDM_KEYWORDS", "")
+KEYWORDS_FILE = os.environ.get(
+    "SMZDM_KEYWORDS_FILE",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "keywords.json"),
+)
 DB_PATH = os.environ.get("SMZDM_DB_PATH", "smzdm.db")
 SMZDM_DETAIL_SIGN_KEY = "apr1$AwP!wRRT$gJ/q.X24poeBInlUJC"
 
@@ -52,7 +64,15 @@ CONFIG = {
     "detail_api_version": "10.4.26",
     "detail_api_revision": "866",
     "max_consecutive_detail_failures": 2,
-    "push_keyword_cooldown_minutes": 45,  # 仅接收人明确的关键词过滤拒绝进入短期冷却
+    "push_keyword_cooldown_minutes": 45,  # 旧 WXPusher 关键词过滤冷却；企业微信无此拒绝语义，保留表结构但不再写入
+    "wecom_title_max_bytes": 128,       # 企业微信 news 标题上限
+    "wecom_description_max_bytes": 512, # 企业微信 news 描述上限
+    "wecom_url_max_bytes": 2048,
+    "wecom_token_error_codes": [40001, 40014, 42001],  # 令牌无效/过期时刷新一次
+    "keyword_search_enabled": True,     # 每轮按关键词主动查询主列表接口的 keyword 参数
+    "keyword_search_limit": 50,
+    "max_keyword_searches_per_run": 10, # 关键词及别名的搜索请求硬上限
+    "keyword_max_age_hours": 12,        # 关键词提醒只推近期爆料，避免首次运行推送大量旧帖
 
     # 第一阶段：综合评分筛选
     "score_weights": {
@@ -314,6 +334,90 @@ logging.basicConfig(
 )
 
 
+def normalize_keyword_text(value):
+    """关键词匹配归一化：全半角统一、忽略大小写、空格和标点（如 京东 PLUS 会员 / 《好奇号》）。"""
+    text = unicodedata.normalize('NFKC', html.unescape(str(value or ''))).lower()
+    text = re.sub(r'<[^>]*>', '', text)
+    return re.sub(r'[\W_]+', '', text)
+
+
+def _keyword_rule(keyword, max_price, aliases=()):
+    terms = []
+    for term in [keyword, *aliases]:
+        term = str(term or '').strip()
+        if term and normalize_keyword_text(term) and term not in terms:
+            terms.append(term)
+    if not terms:
+        return None
+    try:
+        price = float(max_price)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0:
+        return None
+    return {
+        'keyword': terms[0],
+        'terms': terms,
+        'normalized_terms': [normalize_keyword_text(term) for term in terms],
+        'max_price': price,
+    }
+
+
+def parse_keyword_rules(spec):
+    """解析 `好奇号:155,京东plus会员|京东plus年卡:80`；`|` 后为同一规则的别名。"""
+    rules = []
+    text = unicodedata.normalize('NFKC', str(spec or ''))
+    for entry in re.split(r'[,;\n]+', text):
+        entry = entry.strip()
+        if not entry or ':' not in entry:
+            if entry:
+                logging.warning(f"关键词配置缺少价格上限，已忽略: {entry[:40]}")
+            continue
+        names, _, price = entry.rpartition(':')
+        terms = [name.strip() for name in names.split('|')]
+        rule = _keyword_rule(terms[0], price.strip().rstrip('元'), terms[1:])
+        if rule:
+            rules.append(rule)
+        else:
+            logging.warning(f"关键词配置无效，已忽略: {entry[:40]}")
+    return rules
+
+
+def load_keyword_rules(env_spec=None, file_path=None):
+    """环境变量 SMZDM_KEYWORDS 非空时优先；否则读取 keywords.json。"""
+    env_spec = SMZDM_KEYWORDS if env_spec is None else env_spec
+    if str(env_spec or '').strip():
+        return parse_keyword_rules(env_spec)
+    file_path = KEYWORDS_FILE if file_path is None else file_path
+    if not file_path or not os.path.exists(file_path):
+        return []
+    try:
+        with open(file_path, encoding='utf-8') as handle:
+            payload = json.load(handle)
+    except (OSError, ValueError) as e:
+        logging.warning(f"关键词文件读取失败，跳过关键词提醒: {type(e).__name__}")
+        return []
+    if isinstance(payload, dict):
+        payload = payload.get('keywords', payload)
+    rules = []
+    if isinstance(payload, dict):
+        for keyword, price in payload.items():
+            rule = _keyword_rule(keyword, price)
+            if rule:
+                rules.append(rule)
+    elif isinstance(payload, list):
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            aliases = item.get('aliases') or []
+            if not isinstance(aliases, list):
+                aliases = []
+            rule = _keyword_rule(item.get('keyword'), item.get('max_price'), aliases)
+            if rule:
+                rules.append(rule)
+    return rules
+
+
 class SmzdmScraper:
     def __init__(self):
         self.session = requests.Session()
@@ -347,6 +451,15 @@ class SmzdmScraper:
             'total_push_unknown': 0,
             'total_push_keyword_filtered': 0,
             'total_push_keyword_cooldown_skipped': 0,
+            'total_push_dry_run': 0,
+            'total_keyword_searches': 0,
+            'total_keyword_search_failed': 0,
+            'total_keyword_matched': 0,
+            'total_keyword_over_price': 0,
+            'total_keyword_no_price': 0,
+            'total_keyword_duplicates': 0,
+            'total_keyword_inactive': 0,
+            'total_keyword_sent': 0,
             'total_duplicates': 0,
             'total_fingerprint_duplicates': 0,
             'total_product_key_duplicates': 0,
@@ -401,6 +514,11 @@ class SmzdmScraper:
         self.late_recheck_eligible_count = 0
         self.snapshot_keys_seen_this_run = set()
         self.pending_snapshot_writes = 0
+        self.keyword_rules = load_keyword_rules()
+        self.keyword_candidates = {}
+        self.keyword_match_counts = {}
+        self.keyword_pushed_ids = set()
+        self.wecom_access_token = ''
 
     def _init_session(self):
         retry = Retry(
@@ -581,15 +699,24 @@ class SmzdmScraper:
 
     def run(self):
         """单次执行入口：扫描 -> 三层筛选 -> 推送 -> 退出"""
-        if not APP_TOKEN or not UID:
-            logging.error("缺少 WXPUSHER_APP_TOKEN 或 WXPUSHER_UID 环境变量")
+        if not DRY_RUN and not (WECOM_CORPID and WECOM_AGENTID and WECOM_SECRET):
+            logging.error("缺少 WECOM_CORPID、WECOM_AGENTID 或 WECOM_SECRET 环境变量")
             sys.exit(1)
+        if DRY_RUN:
+            logging.info("DRY_RUN 已开启：只记录推送载荷，不请求企业微信，也不写入推送历史")
 
         logging.info("开始扫描...")
         self._clean_old_records()
+        if self.keyword_rules:
+            logging.info("关键词低价提醒: " + ", ".join(
+                f"{'|'.join(rule['terms'])}≤{rule['max_price']:g}元" for rule in self.keyword_rules
+            ))
 
         # 第一轮：API 扫描 + 综合评分筛选，收集候选商品
         candidates = self._scan_and_filter_stage1()
+        # 关键词低价提醒：主列表命中 + 按关键词主动查询；绕过热度筛选，仍按历史去重。
+        self._search_keyword_deals()
+        self._process_keyword_candidates()
         self._enrich_candidates_from_channel_apis(candidates)
         candidates = self._prioritize_candidates(candidates)
         self.jd_self_check_limit = self._calculate_jd_self_check_limit(candidates)
@@ -604,6 +731,8 @@ class SmzdmScraper:
 
         # 第二轮：可选京东自营、评论等级、互动异常检测
         for parsed in candidates:
+            if parsed.get('id') in self.keyword_pushed_ids:
+                continue
             if self._skip_push_keyword_cooldown(parsed):
                 continue
             if CONFIG['jd_self_filter_enabled'] and not self._check_jd_self_operated(parsed):
@@ -729,6 +858,7 @@ class SmzdmScraper:
                     break
 
                 processed_ids.add(parsed['id'])
+                self._observe_keyword_match(parsed)
                 rank_entry = rank_by_id.get(parsed['id'])
                 if rank_entry:
                     self._apply_rank_metrics(parsed, rank_entry[1], rank_entry[0])
@@ -747,6 +877,7 @@ class SmzdmScraper:
                 continue
             parsed = self._parse_rank_item(row, position)
             if parsed:
+                self._observe_keyword_match(parsed)
                 self._consider_stage1_candidate(parsed, candidates)
 
         self._append_late_recheck_candidates(discovered_ids, candidates)
@@ -1200,6 +1331,7 @@ class SmzdmScraper:
             'article_unworthy': row.get('article_unworthy'),
             'article_comment': row.get('article_comment'),
             'article_is_sold_out': row.get('article_stock_status'),
+            'article_pic': row.get('article_pic'),
             'tongji_hudong': self._rank_tongji_hudong(row),
         }
         parsed = self._parse_item(mapped)
@@ -1310,6 +1442,7 @@ class SmzdmScraper:
             'title': title,
             'price': str(item.get('article_price', '未知')).strip(),
             'link': str(item.get('article_url', '')).strip(),
+            'pic': str(item.get('article_pic') or '').strip(),
             'article_link': article_link,
             'channel_type': channel_type,
             'mall': str(item.get('article_mall', '未知')).strip(),
@@ -1658,6 +1791,8 @@ class SmzdmScraper:
     def _candidate_log_context(parsed):
         article_id = str(parsed.get('id') or parsed.get('article_id') or '-').strip()
         source = '延迟详情' if parsed.get('late_recheck_source') else '主列表'
+        if parsed.get('keyword_search_source'):
+            source = '关键词查询'
         if parsed.get('rank_source'):
             rank = f"{parsed.get('rank_window_hours') or 12}小时榜#{parsed.get('rank_position') or '-'}"
             source = rank if not parsed.get('late_recheck_source') else f'{source}+{rank}'
@@ -3313,14 +3448,151 @@ class SmzdmScraper:
             and trend.get('recent_growth_score', 0) <= CONFIG['trend_stale_max_growth_score']
         )
 
+    # ==================== 关键词低价提醒 ====================
+
+    def _match_keyword_rule(self, title):
+        normalized = normalize_keyword_text(title)
+        if not normalized:
+            return None
+        for rule in self.keyword_rules:
+            if any(term and term in normalized for term in rule['normalized_terms']):
+                return rule
+        return None
+
+    def _observe_keyword_match(self, parsed):
+        """记录标题命中关键词的文章；价格、状态与去重在推送前统一判断。"""
+        if not self.keyword_rules or not parsed or not parsed.get('id'):
+            return None
+        rule = self._match_keyword_rule(parsed.get('title'))
+        if not rule:
+            return None
+        article_id = parsed['id']
+        if article_id not in self.keyword_candidates:
+            # 复制一份，避免热度流程后续写入的趋势/评论字段影响关键词推送。
+            candidate = dict(parsed)
+            candidate['keyword_rule'] = rule
+            self.keyword_candidates[article_id] = candidate
+            self.stats['total_keyword_matched'] += 1
+            key = rule['keyword']
+            self.keyword_match_counts[key] = self.keyword_match_counts.get(key, 0) + 1
+        return rule
+
+    def _search_keyword_deals(self):
+        """每个关键词/别名只请求一次主列表接口的 keyword 查询，失败不影响主流程。"""
+        if not self.keyword_rules or not CONFIG.get('keyword_search_enabled'):
+            return
+        budget = max(0, int(CONFIG.get('max_keyword_searches_per_run', 0)))
+        terms = [term for rule in self.keyword_rules for term in rule['terms']]
+        if len(terms) > budget:
+            logging.warning(f"关键词查询 {len(terms)} 个，超出单轮上限 {budget}，其余仅依赖主列表命中")
+        for term in terms[:budget]:
+            self.stats['total_keyword_searches'] += 1
+            rows = self._fetch_keyword_rows(term)
+            if rows is None:
+                self.stats['total_keyword_search_failed'] += 1
+                continue
+            matched = 0
+            for item in rows:
+                parsed = self._parse_item(item)
+                if not parsed or parsed.get('age_hours', 0) > CONFIG['keyword_max_age_hours']:
+                    continue
+                parsed['keyword_search_source'] = True
+                if self._observe_keyword_match(parsed):
+                    matched += 1
+            logging.info(f"[关键词查询] {term}: 返回 {len(rows)} 条，标题命中 {matched} 条（{CONFIG['keyword_max_age_hours']} 小时内）")
+            time.sleep(random.uniform(*CONFIG['request_delay']))
+
+    def _fetch_keyword_rows(self, term):
+        try:
+            response = self.session.get(
+                'https://api.smzdm.com/v1/list',
+                params={'keyword': term, 'limit': CONFIG['keyword_search_limit'], 'offset': 0},
+                timeout=CONFIG['timeout'],
+            )
+            if response.status_code != 200:
+                logging.warning(f"[关键词查询失败] {term}: HTTP {response.status_code}")
+                return None
+            payload = response.json()
+            data = payload.get('data') if isinstance(payload, dict) else None
+            rows = data.get('rows') if isinstance(data, dict) else None
+            if str(payload.get('error_code')) != '0' or not isinstance(rows, list):
+                logging.warning(f"[关键词查询失败] {term}: 返回格式异常")
+                return None
+            return [row for row in rows if isinstance(row, dict)]
+        except Exception as e:
+            logging.warning(f"[关键词查询失败] {term}: {type(e).__name__}")
+            return None
+
+    def _keyword_skip_reason(self, parsed):
+        rule = parsed.get('keyword_rule') or {}
+        if parsed.get('age_hours', 0) > CONFIG['keyword_max_age_hours']:
+            return 'age', None
+        if self._is_inactive_deal(parsed):
+            self.stats['total_keyword_inactive'] += 1
+            return 'inactive', '已售罄/过期'
+        if self._is_title_blocked(parsed):
+            return 'title', '任务/活动标题'
+        price_value = parsed.get('price_value')
+        if price_value is None:
+            self.stats['total_keyword_no_price'] += 1
+            return 'no_price', '价格无法解析'
+        if price_value > rule.get('max_price', 0):
+            self.stats['total_keyword_over_price'] += 1
+            return 'over_price', f"价格 {price_value:g} > {rule.get('max_price', 0):g}"
+        if self._is_keyword_history_duplicate(parsed):
+            self.stats['total_keyword_duplicates'] += 1
+            return 'duplicate', '已推送过'
+        return '', None
+
+    def _is_keyword_history_duplicate(self, parsed):
+        # 不使用 seen_ids：热度候选在本轮也会加入 seen_ids，但它们尚未推送。
+        if self.conn.execute('SELECT 1 FROM history WHERE id = ?', (parsed['id'],)).fetchone():
+            return True
+        return self._is_send_duplicate(parsed)
+
+    def _process_keyword_candidates(self):
+        # 同一关键词同价的多条爆料（如同一杂志被连续重复发帖）每轮只推最新一条。
+        pushed_prices = set()
+        for parsed in sorted(self.keyword_candidates.values(), key=lambda row: row.get('age_hours', 0)):
+            rule = parsed['keyword_rule']
+            reason, note = self._keyword_skip_reason(parsed)
+            price_key = (rule['keyword'], parsed.get('price_value'))
+            if not reason and price_key in pushed_prices:
+                self.stats['total_keyword_duplicates'] += 1
+                reason, note = 'same_price', '本轮同关键词同价已推送'
+            if reason:
+                if note:
+                    logging.info(
+                        f"[关键词跳过:{note}] {rule['keyword']} | {parsed['title'][:40]} | "
+                        f"{self._candidate_log_context(parsed)} 价格:{parsed.get('price', '-')}"
+                    )
+                continue
+            parsed['quality_path'] = f"关键词:{rule['keyword']}"
+            logging.info(
+                f"[关键词命中] {rule['keyword']}≤{rule['max_price']:g} | {parsed['title'][:40]} | "
+                f"{self._candidate_log_context(parsed)} 价格:{parsed.get('price', '-')}"
+            )
+            sent = self._send_notification(parsed)
+            if sent or DRY_RUN:
+                pushed_prices.add(price_key)
+            if sent:
+                self._save_history(parsed)
+                self.keyword_pushed_ids.add(parsed['id'])
+                self.stats['total_sent'] += 1
+                self.stats['total_keyword_sent'] += 1
+                path = parsed['quality_path']
+                self.quality_path_sent_counts[path] = self.quality_path_sent_counts.get(path, 0) + 1
+
     # ==================== 推送 ====================
 
     @staticmethod
     def _push_recipient_key():
-        """只保存接收人哈希；冷却不跨 UID，也不属于已推送历史。"""
-        if not isinstance(UID, str) or not UID or re.search(r'[\s\x00-\x1f\x7f,;]', UID):
+        """只保存接收人哈希；冷却按企业/应用/接收人隔离，也不属于已推送历史。"""
+        target = f"{WECOM_CORPID}:{WECOM_AGENTID}:{WECOM_TOUSER}"
+        if (not isinstance(WECOM_TOUSER, str) or not WECOM_TOUSER
+                or re.search(r'[\s\x00-\x1f\x7f,;]', WECOM_TOUSER)):
             return ''
-        return hashlib.sha256(UID.encode('utf-8')).hexdigest()
+        return hashlib.sha256(target.encode('utf-8')).hexdigest()
 
     def _is_push_keyword_cooling_down(self, article_id):
         recipient_key = self._push_recipient_key()
@@ -3344,6 +3616,8 @@ class SmzdmScraper:
         return True
 
     def _save_push_keyword_cooldown(self, article_id):
+        """旧 WXPusher 关键词过滤冷却。企业微信没有对应的拒绝语义，发送流程不再调用，
+        保留以兼容旧缓存数据库中的冷却表和延迟复查排除逻辑。"""
         minutes = max(0, int(CONFIG.get('push_keyword_cooldown_minutes', 45)))
         recipient_key = self._push_recipient_key()
         article_id = str(article_id or '').strip()
@@ -3359,18 +3633,135 @@ class SmzdmScraper:
         )
         self.conn.commit()
 
+    # ---------- 企业微信 ----------
+
     @staticmethod
-    def _is_target_keyword_rejection(target):
-        # 只认已在真实返回中出现的明确拒绝措辞，不能把任意失败或“关键字”提示当作用户过滤。
-        status = target.get('status')
-        return (
-            target.get('code') == 1001
-            and isinstance(status, str)
-            and '因为用户设置的关键字过滤，不发送' in status
-        )
+    def _clip_utf8(value, max_bytes, ellipsis='…'):
+        """按 UTF-8 字节截断，不切断多字节字符。"""
+        text = str(value or '')
+        if len(text.encode('utf-8')) <= max_bytes:
+            return text
+        budget = max_bytes - len(ellipsis.encode('utf-8'))
+        result = []
+        used = 0
+        for char in text:
+            size = len(char.encode('utf-8'))
+            if used + size > budget:
+                break
+            result.append(char)
+            used += size
+        return ''.join(result).rstrip() + ellipsis
+
+    @staticmethod
+    def _format_price_number(value):
+        return f"{float(value):.2f}".rstrip('0').rstrip('.')
+
+    def _wecom_redact(self, value):
+        if not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            return '-'
+        text = str(value)
+        for secret in (WECOM_SECRET, getattr(self, 'wecom_access_token', '')):
+            if secret:
+                text = text.replace(secret, '[已隐藏]')
+        return re.sub(r'[\r\n\t\x00-\x1f\x7f]', ' ', text)[:160]
+
+    def _build_wecom_title(self, data):
+        short_title = self._notification_short_title(data)
+        rule = data.get('keyword_rule')
+        if rule and data.get('price_value') is not None:
+            prefix = f"[关键词:{rule['keyword']}] ¥{self._format_price_number(data['price_value'])}"
+        else:
+            prefix = self._notification_display_price(data)
+        return self._clip_utf8(f"{prefix} {short_title}".strip(), CONFIG['wecom_title_max_bytes'])
+
+    def _build_wecom_description(self, data):
+        mall = self._notification_plain_text(data.get('mall')) or '未知平台'
+        pub_time = self._notification_plain_text(data.get('pub_time'))
+        source_line = f"{mall} · 发布 {pub_time}" if pub_time else mall
+        rule = data.get('keyword_rule')
+        if rule:
+            conditions = '/'.join(self._notification_purchase_conditions(data)) or '未识别额外条件'
+            lines = [
+                f"{self._notification_display_price(data)}｜{conditions}｜阈值≤{rule['max_price']:g}元",
+                self._notification_short_title(data),
+                source_line,
+                '关键词低价提醒，未经热度筛选；价格与购买条件以原文为准',
+            ]
+        else:
+            metrics = self._current_interaction_metrics(data)
+            lines = [
+                self._build_notification_summary(data),
+                source_line,
+                f"{int(data.get('worthy', 0))}值/{int(data.get('unworthy', 0))}不值 · "
+                f"{int(data.get('comments', 0))}评 · {int(data.get('collection', 0))}藏 · "
+                f"互动分{metrics['composite_score']} · {data.get('quality_path', '综合筛选')}",
+            ]
+        return self._clip_utf8('\n'.join(line for line in lines if line), CONFIG['wecom_description_max_bytes'])
+
+    def _wecom_article_url(self, data):
+        url = self._notification_original_url(data.get('link'))
+        if not url:
+            article_id = str(data.get('id') or '').strip()
+            if article_id.isdigit():
+                url = f'https://www.smzdm.com/p/{article_id}/'
+        if url and len(url.encode('utf-8')) > CONFIG['wecom_url_max_bytes']:
+            return ''
+        return url
+
+    def _build_wecom_payload(self, data):
+        article = {
+            'title': self._build_wecom_title(data),
+            'description': self._build_wecom_description(data),
+        }
+        url = self._wecom_article_url(data)
+        if url:
+            article['url'] = url
+        picurl = self._notification_original_url(data.get('pic'))
+        if picurl:
+            article['picurl'] = picurl
+        agentid = int(WECOM_AGENTID) if str(WECOM_AGENTID).isdigit() else WECOM_AGENTID
+        return {
+            'touser': WECOM_TOUSER,
+            'msgtype': 'news',
+            'agentid': agentid,
+            'news': {'articles': [article]},
+            # 缓存回滚导致同一商品重复发送时，由企业微信在 30 分钟内去重。
+            'enable_duplicate_check': 1,
+            'duplicate_check_interval': 1800,
+        }
+
+    def _get_wecom_access_token(self, force_refresh=False):
+        """单轮运行内缓存 access_token；失败返回 (None, 原因)。"""
+        cached = getattr(self, 'wecom_access_token', '')
+        if cached and not force_refresh:
+            return cached, ''
+        self.wecom_access_token = ''
+        try:
+            response = requests.get(
+                f'{WECOM_API_BASE}/gettoken',
+                params={'corpid': WECOM_CORPID, 'corpsecret': WECOM_SECRET},
+                timeout=10,
+            )
+            if response.status_code != 200:
+                return None, f'gettoken HTTP {response.status_code}'
+            result = response.json()
+        except requests.Timeout:
+            return None, 'gettoken 超时'
+        except ValueError:
+            return None, 'gettoken JSON 无法解析'
+        except Exception as e:
+            return None, f'gettoken 异常类型:{type(e).__name__}'
+        if not isinstance(result, dict):
+            return None, 'gettoken 返回不是对象'
+        token = result.get('access_token')
+        if result.get('errcode') != 0 or not isinstance(token, str) or not token:
+            return None, (f"gettoken errcode:{self._wecom_redact(result.get('errcode'))} "
+                          f"errmsg:{self._wecom_redact(result.get('errmsg'))}")
+        self.wecom_access_token = token
+        return token, ''
 
     def _send_notification(self, data):
-        """确认目标接收人的发送任务已创建；不代表异步消息已经到达。"""
+        """企业微信 errcode=0 才视为成功并允许写入历史。"""
         data.pop('push_send_record_id', None)
 
         def failed(reason, unknown=False):
@@ -3380,81 +3771,60 @@ class SmzdmScraper:
             logging.error(f"[推送{'结果未知' if unknown else '失败'}] {self._candidate_log_context(data)} {reason}")
             return False
 
-        def safe_field(value):
-            # 接口状态可能回显鉴权信息，不记录原始响应或异常正文。
-            if not isinstance(value, (str, int, float)) or isinstance(value, bool):
-                return '-'
-            text = str(value)
-            for secret in (APP_TOKEN, UID):
-                if secret:
-                    text = text.replace(secret, '[已隐藏]')
-            return re.sub(r'[\r\n\t\x00-\x1f\x7f]', ' ', text)[:120]
-
-        if not isinstance(UID, str) or not UID or re.search(r'[\s\x00-\x1f\x7f,;]', UID):
-            return failed('接收人配置为空或不是单个有效 UID')
+        if (not isinstance(WECOM_TOUSER, str) or not WECOM_TOUSER
+                or re.search(r'[\s\x00-\x1f\x7f,;]', WECOM_TOUSER)):
+            return failed('接收人配置为空或格式无效（多人请用 | 分隔）')
         if self._skip_push_keyword_cooldown(data):
             return False
 
         try:
-            content = self._build_notification_content(data)
-            payload = {
-                "appToken": APP_TOKEN,
-                "content": content,
-                "summary": self._build_notification_summary(data),
-                "contentType": 2,
-                "uids": [UID],
-            }
-            original_url = self._notification_original_url(data.get('link'))
-            if original_url:
-                # JSON 使用原始 URL；HTML 的 &amp; 转义不能用于原文链接字段。
-                payload['url'] = original_url
-            response = requests.post(
-                'https://wxpusher.zjiecode.com/api/send/message',
-                json=payload,
-                timeout=10
-            )
-            if response.status_code != 200:
-                return failed(f'HTTP {response.status_code}')
+            payload = self._build_wecom_payload(data)
+            if DRY_RUN:
+                self.stats['total_push_dry_run'] += 1
+                logging.info(
+                    f"[DRY_RUN 推送载荷] {self._candidate_log_context(data)} "
+                    + json.dumps(payload, ensure_ascii=False)
+                )
+                return False
+            if not (WECOM_CORPID and WECOM_AGENTID and WECOM_SECRET):
+                return failed('企业微信配置不完整')
 
-            result = response.json()
-            if not isinstance(result, dict):
-                return failed('接口返回的 JSON 不是对象')
-            if result.get('success') is not True or result.get('code') != 1000:
-                return failed(f"接口业务码:{safe_field(result.get('code'))}")
-            recipients = result.get('data')
-            if not isinstance(recipients, list):
-                return failed('接口缺少接收人结果数组')
-            target_results = [
-                recipient for recipient in recipients
-                if isinstance(recipient, dict) and recipient.get('uid') == UID
-            ]
-            if len(target_results) != 1:
-                return failed('接口未返回唯一的目标接收人结果')
-            target = target_results[0]
-            recipient_code = safe_field(target.get('code'))
-            recipient_status = safe_field(target.get('status'))
-            record_id = target.get('sendRecordId')
-            if isinstance(record_id, int) and not isinstance(record_id, bool) and record_id > 0:
-                record_id = str(record_id)
-            elif isinstance(record_id, str) and re.fullmatch(r'[0-9]{1,30}', record_id):
-                pass
-            else:
-                record_id = ''
+            result = None
+            for attempt in range(2):
+                token, reason = self._get_wecom_access_token(force_refresh=attempt > 0)
+                if not token:
+                    return failed(reason)
+                response = requests.post(
+                    f'{WECOM_API_BASE}/message/send',
+                    params={'access_token': token},
+                    json=payload,
+                    timeout=10,
+                )
+                if response.status_code != 200:
+                    return failed(f'HTTP {response.status_code}')
+                result = response.json()
+                if not isinstance(result, dict):
+                    return failed('接口返回的 JSON 不是对象')
+                # 令牌失效时消息未被接受，刷新后只重试一次。
+                if attempt == 0 and result.get('errcode') in CONFIG['wecom_token_error_codes']:
+                    logging.warning(f"企业微信 access_token 失效 errcode:{self._wecom_redact(result.get('errcode'))}，刷新后重试一次")
+                    continue
+                break
+
+            errcode = result.get('errcode')
             delivery_note = (
-                f"接收人code:{recipient_code} status:{recipient_status} "
-                f"sendRecordId:{record_id or '-'}"
+                f"errcode:{self._wecom_redact(errcode)} errmsg:{self._wecom_redact(result.get('errmsg'))}"
             )
-            if target.get('code') != 1000:
-                if self._is_target_keyword_rejection(target):
-                    self.stats['total_push_keyword_filtered'] += 1
-                    self._save_push_keyword_cooldown(data.get('id'))
-                    logging.info(
-                        f"[关键词过滤冷却] {self._candidate_log_context(data)} "
-                        f"冷却:{CONFIG['push_keyword_cooldown_minutes']}分钟 | {delivery_note}"
-                    )
-                    return False
+            if errcode != 0 or isinstance(errcode, bool):
                 return failed(delivery_note)
-
+            msgid = result.get('msgid')
+            record_id = msgid if isinstance(msgid, str) and re.fullmatch(r'[A-Za-z0-9_\-]{1,128}', msgid) else ''
+            invalid = [
+                key for key in ('invaliduser', 'invalidparty', 'invalidtag', 'unlicenseduser')
+                if result.get(key)
+            ]
+            if invalid:
+                delivery_note += ' 部分接收人无效:' + ','.join(invalid)
             data['push_send_record_id'] = record_id
             metrics = self._current_interaction_metrics(data)
             logging.info(
@@ -3468,11 +3838,11 @@ class SmzdmScraper:
                 f"收藏:{data.get('collection', 0)} "
                 f"值:{data.get('worthy', 0)} "
                 f"不值:{data.get('unworthy', 0)} | "
-                f"{delivery_note}（发送任务已创建，异步到达未确认）"
+                f"{delivery_note} msgid:{'有' if record_id else '-'}"
             )
             return True
         except requests.Timeout:
-            # POST 超时无法判断服务端是否创建了任务，不立即重试以免重复通知。
+            # POST 超时无法判断服务端是否已发送，不立即重试以免重复通知。
             return failed('POST 超时，未即时重试；服务端是否接受未知', unknown=True)
         except ValueError:
             return failed('接口 JSON 无法解析')
@@ -4030,7 +4400,16 @@ class SmzdmScraper:
         logging.info(f"  成功推送: {self.stats['total_sent']}")
         logging.info(f"  推送失败: {self.stats['total_push_failed']}")
         logging.info(f"    POST 超时结果未知: {self.stats['total_push_unknown']}")
-        logging.info(f"  接收人关键词明确过滤: {self.stats['total_push_keyword_filtered']}")
+        logging.info(f"  DRY_RUN 未发送载荷: {self.stats['total_push_dry_run']}")
+        logging.info(f"  关键词查询请求: {self.stats['total_keyword_searches']}（失败 {self.stats['total_keyword_search_failed']}）")
+        logging.info(f"  关键词标题命中: {self.stats['total_keyword_matched']}")
+        if self.keyword_match_counts:
+            logging.info("    " + ", ".join(f"{key}:{count}" for key, count in self.keyword_match_counts.items()))
+        logging.info(f"  关键词超价跳过: {self.stats['total_keyword_over_price']}")
+        logging.info(f"  关键词无价格跳过: {self.stats['total_keyword_no_price']}")
+        logging.info(f"  关键词售罄/过期跳过: {self.stats['total_keyword_inactive']}")
+        logging.info(f"  关键词已推送跳过: {self.stats['total_keyword_duplicates']}")
+        logging.info(f"  关键词低价推送: {self.stats['total_keyword_sent']}")
         logging.info(f"  关键词冷却候选跳过: {self.stats['total_push_keyword_cooldown_skipped']}")
         if self.quality_path_sent_counts:
             sent_summary = ", ".join(
