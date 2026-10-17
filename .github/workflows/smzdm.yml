@@ -131,6 +131,8 @@ jobs:
           WECOM_AGENTID: ${{ secrets.WECOM_AGENTID }}
           WECOM_SECRET: ${{ secrets.WECOM_SECRET }}
           WECOM_TOUSER: ${{ vars.WECOM_TOUSER || '@all' }}
+          # 群机器人 Webhook；设置后优先使用，留空则走自建应用消息
+          WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
           # 留空则使用仓库内 keywords.json；格式：好奇号:155,京东plus会员|京东plus年卡:80
           SMZDM_KEYWORDS: ${{ vars.SMZDM_KEYWORDS }}
           DRY_RUN: ${{ vars.DRY_RUN }}

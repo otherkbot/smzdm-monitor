@@ -28,6 +28,8 @@ WECOM_AGENTID = os.environ.get("WECOM_AGENTID", "").strip()
 WECOM_SECRET = os.environ.get("WECOM_SECRET", "").strip()
 WECOM_TOUSER = os.environ.get("WECOM_TOUSER", "").strip() or "@all"
 WECOM_API_BASE = "https://qyapi.weixin.qq.com/cgi-bin"
+# 企业微信群机器人（消息推送）Webhook；配置后优先走群机器人，不再需要 corpid/secret。
+WECOM_WEBHOOK_URL = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
 # 仅记录将要发送的载荷，不请求企业微信、不写入推送历史
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes", "on")
 # 关键词低价提醒：环境变量优先，其次仓库内 keywords.json
@@ -69,6 +71,9 @@ CONFIG = {
     "wecom_description_max_bytes": 512, # 企业微信 news 描述上限
     "wecom_url_max_bytes": 2048,
     "wecom_token_error_codes": [40001, 40014, 42001],  # 令牌无效/过期时刷新一次
+    "wecom_webhook_min_interval": 3.2,  # 群机器人每分钟最多 20 条，两次发送至少间隔 3.2 秒
+    "wecom_webhook_rate_limit_codes": [45009],  # 超频：等待后只重试一次
+    "wecom_webhook_rate_limit_wait": 60,
     "keyword_search_enabled": True,     # 每轮按关键词主动查询主列表接口的 keyword 参数
     "keyword_search_limit": 50,
     "max_keyword_searches_per_run": 10, # 关键词及别名的搜索请求硬上限
@@ -519,6 +524,7 @@ class SmzdmScraper:
         self.keyword_match_counts = {}
         self.keyword_pushed_ids = set()
         self.wecom_access_token = ''
+        self.wecom_webhook_last_send = None
 
     def _init_session(self):
         retry = Retry(
@@ -699,9 +705,13 @@ class SmzdmScraper:
 
     def run(self):
         """单次执行入口：扫描 -> 三层筛选 -> 推送 -> 退出"""
-        if not DRY_RUN and not (WECOM_CORPID and WECOM_AGENTID and WECOM_SECRET):
-            logging.error("缺少 WECOM_CORPID、WECOM_AGENTID 或 WECOM_SECRET 环境变量")
+        if WECOM_WEBHOOK_URL:
+            logging.info(f"推送通道：企业微信群机器人 Webhook（{self._mask_webhook_url(WECOM_WEBHOOK_URL)}）")
+        elif not DRY_RUN and not (WECOM_CORPID and WECOM_AGENTID and WECOM_SECRET):
+            logging.error("缺少 WECOM_WEBHOOK_URL，或 WECOM_CORPID、WECOM_AGENTID、WECOM_SECRET 环境变量")
             sys.exit(1)
+        else:
+            logging.info("推送通道：企业微信自建应用消息")
         if DRY_RUN:
             logging.info("DRY_RUN 已开启：只记录推送载荷，不请求企业微信，也不写入推送历史")
 
@@ -3660,7 +3670,11 @@ class SmzdmScraper:
         if not isinstance(value, (str, int, float)) or isinstance(value, bool):
             return '-'
         text = str(value)
-        for secret in (WECOM_SECRET, getattr(self, 'wecom_access_token', '')):
+        secrets = [WECOM_SECRET, getattr(self, 'wecom_access_token', ''), WECOM_WEBHOOK_URL]
+        webhook_key = self._webhook_key(WECOM_WEBHOOK_URL)
+        if webhook_key:
+            secrets.append(webhook_key)
+        for secret in secrets:
             if secret:
                 text = text.replace(secret, '[已隐藏]')
         return re.sub(r'[\r\n\t\x00-\x1f\x7f]', ' ', text)[:160]
@@ -3730,6 +3744,56 @@ class SmzdmScraper:
             'duplicate_check_interval': 1800,
         }
 
+    @staticmethod
+    def _webhook_key(url):
+        match = re.search(r'[?&]key=([^&#]+)', str(url or ''))
+        return match.group(1) if match else ''
+
+    @classmethod
+    def _mask_webhook_url(cls, url):
+        """日志里只保留 key 前 4 位，避免泄露 Webhook。"""
+        url = str(url or '')
+        key = cls._webhook_key(url)
+        if key:
+            return url.split('?', 1)[0] + f'?key={key[:4]}***'
+        return url.split('?', 1)[0] + '?***' if url else '-'
+
+    def _build_wecom_webhook_payload(self, data):
+        """群机器人 news：沿用应用消息的 title/description/url/picurl 与字节上限。"""
+        article = self._build_wecom_payload(data)['news']['articles'][0]
+        return {'msgtype': 'news', 'news': {'articles': [article]}}
+
+    def _pace_webhook_send(self):
+        interval = float(CONFIG.get('wecom_webhook_min_interval', 0) or 0)
+        last = getattr(self, 'wecom_webhook_last_send', None)
+        if interval > 0 and last is not None:
+            wait = interval - (time.monotonic() - last)
+            if wait > 0:
+                time.sleep(wait)
+        self.wecom_webhook_last_send = time.monotonic()
+
+    def _post_wecom_webhook(self, payload):
+        """返回 (result_dict, 失败原因, 是否结果未知)。45009 超频时等待后只重试一次。"""
+        result = None
+        for attempt in range(2):
+            self._pace_webhook_send()
+            try:
+                response = requests.post(WECOM_WEBHOOK_URL, json=payload, timeout=10)
+            except requests.Timeout:
+                return None, 'Webhook POST 超时，未即时重试；服务端是否接受未知', True
+            if response.status_code != 200:
+                return None, f'Webhook HTTP {response.status_code}', False
+            result = response.json()
+            if not isinstance(result, dict):
+                return None, 'Webhook 返回的 JSON 不是对象', False
+            if attempt == 0 and result.get('errcode') in CONFIG['wecom_webhook_rate_limit_codes']:
+                wait = float(CONFIG.get('wecom_webhook_rate_limit_wait', 60))
+                logging.warning(f"群机器人超频 errcode:{self._wecom_redact(result.get('errcode'))}，等待 {wait:g} 秒后重试一次")
+                time.sleep(wait)
+                continue
+            break
+        return result, '', False
+
     def _get_wecom_access_token(self, force_refresh=False):
         """单轮运行内缓存 access_token；失败返回 (None, 原因)。"""
         cached = getattr(self, 'wecom_access_token', '')
@@ -3778,7 +3842,9 @@ class SmzdmScraper:
             return False
 
         try:
-            payload = self._build_wecom_payload(data)
+            use_webhook = bool(WECOM_WEBHOOK_URL)
+            payload = (self._build_wecom_webhook_payload(data) if use_webhook
+                       else self._build_wecom_payload(data))
             if DRY_RUN:
                 self.stats['total_push_dry_run'] += 1
                 logging.info(
@@ -3786,6 +3852,26 @@ class SmzdmScraper:
                     + json.dumps(payload, ensure_ascii=False)
                 )
                 return False
+            if use_webhook:
+                result, reason, unknown = self._post_wecom_webhook(payload)
+                if result is None:
+                    return failed(reason, unknown=unknown)
+                errcode = result.get('errcode')
+                delivery_note = (
+                    f"群机器人 errcode:{self._wecom_redact(errcode)} errmsg:{self._wecom_redact(result.get('errmsg'))}"
+                )
+                if errcode != 0 or isinstance(errcode, bool):
+                    return failed(delivery_note)
+                data['push_send_record_id'] = ''
+                metrics = self._current_interaction_metrics(data)
+                logging.info(
+                    f"[推送成功] {data['title'][:40]}... | "
+                    f"{self._candidate_log_context(data)} "
+                    f"路径:{data.get('quality_path', '未知')} "
+                    f"价格:{data.get('price', '-')} "
+                    f"评分:{metrics['composite_score']} | {delivery_note}"
+                )
+                return True
             if not (WECOM_CORPID and WECOM_AGENTID and WECOM_SECRET):
                 return failed('企业微信配置不完整')
 

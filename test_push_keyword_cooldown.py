@@ -21,6 +21,7 @@ class PushKeywordCooldownTests(unittest.TestCase):
         self.patches.enter_context(patch('smzdm.WECOM_CORPID', 'ww_private_corp'))
         self.patches.enter_context(patch('smzdm.WECOM_AGENTID', '1000003'))
         self.patches.enter_context(patch('smzdm.WECOM_SECRET', 'SECRET_private_value'))
+        self.patches.enter_context(patch('smzdm.WECOM_WEBHOOK_URL', ''))
         self.patches.enter_context(patch('smzdm.WECOM_TOUSER', '@all'))
         self.patches.enter_context(patch('smzdm.DRY_RUN', False))
         self.post = self.patches.enter_context(patch('smzdm.requests.post'))

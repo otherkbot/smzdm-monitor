@@ -191,6 +191,7 @@ class SmzdmFilterTests(unittest.TestCase):
     @patch("smzdm.WECOM_CORPID", "ww_test_corp")
     @patch("smzdm.WECOM_AGENTID", "1000003")
     @patch("smzdm.WECOM_SECRET", "SECRET_test")
+    @patch("smzdm.WECOM_WEBHOOK_URL", "")
     @patch("smzdm.WECOM_TOUSER", "@all")
     @patch("smzdm.requests.get")
     @patch("smzdm.requests.post")

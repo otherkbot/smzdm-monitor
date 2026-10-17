@@ -7,6 +7,8 @@
 这是一套广泛发现工具。互动热度能说明社区关注，不能证明商品适合每个人，也不能直接证明同类中质量更好或价格更便宜。推送会展示能确认的理由和条件，帮助快速判断；未核验的价格优势会明确说明，不凭品牌、低价或筛选路径给商品作质量认证。这次展示改动复用已有数据，不增加外部请求。
 
 > **本分支改动（2026-10-17）**：推送通道由 WXPusher 改为企业微信自建应用图文消息（`news`，点卡片直接打开 SMZDM 原文）；新增“关键词低价提醒”（见第 10 节）；热度推送逻辑不变。
+>
+> **2026-10-18**：新增企业微信群机器人（消息推送）Webhook 通道。配置 `WECOM_WEBHOOK_URL` 后优先走群机器人（同样的 `news` 卡片，无需 corpid/Secret/token）；未配置时继续走自建应用消息。群机器人每分钟最多 20 条，脚本两次发送至少间隔 3.2 秒，遇 `errcode=45009`（超频）等待 60 秒后只重试一次；`errcode=0` 才写入推送历史。日志中 Webhook key 只显示前 4 位。
 
 ## 当前逻辑
 
@@ -205,6 +207,7 @@ DRY_RUN=1 SMZDM_DB_PATH=/tmp/dry.db python3 smzdm.py
 
 环境变量：
 
+- `WECOM_WEBHOOK_URL`：可选，企业微信群机器人（消息推送）Webhook 地址；设置后走群机器人，下面四项可不填。
 - `WECOM_CORPID`：企业微信企业 ID。
 - `WECOM_AGENTID`：自建应用 AgentId。
 - `WECOM_SECRET`：自建应用 Secret。
@@ -233,7 +236,7 @@ python3 -m unittest -v
 - 使用 `concurrency: smzdm-scan` 避免同仓库扫描任务并发执行。
 - 单次任务最长运行 12 分钟，避免故障任务占住后续 15 分钟扫描窗口。
 - 扫描前运行单元测试，失败时停止本轮，避免带着已知回归继续推送。
-- 需要的仓库配置（Settings → Secrets and variables → Actions）：Secrets `WECOM_CORPID`、`WECOM_AGENTID`、`WECOM_SECRET`；可选 Variables `WECOM_TOUSER`（默认 `@all`）、`SMZDM_KEYWORDS`（留空用 `keywords.json`）、`DRY_RUN`。
+- 需要的仓库配置（Settings → Secrets and variables → Actions）：Secrets `WECOM_WEBHOOK_URL`（群机器人，优先）或 `WECOM_CORPID`、`WECOM_AGENTID`、`WECOM_SECRET`（自建应用）；可选 Variables `WECOM_TOUSER`（默认 `@all`）、`SMZDM_KEYWORDS`（留空用 `keywords.json`）、`DRY_RUN`。
 
 本次保留每 15 分钟执行：2026-10-10 复盘中最近 100 次平均约 4 分钟完成，且 72 次已读满 5100 行；提高频率会增加重复请求，降低频率会延迟早期信号和第二次趋势观察。少数未启动脚本的 hosted runner 故障由下一轮恢复，不额外立即重跑。这个判断针对上述样本，后续可依据漏推、时延和外部限流再调整。
 
@@ -269,6 +272,7 @@ python3 -m unittest -v
 - `test_notification_format.py`：通知摘要、购买条件与详情展示测试。
 - `test_push_delivery.py`：企业微信令牌缓存/刷新、`errcode` 判定、超时、DRY_RUN 与发送记录兼容测试。
 - `test_push_keyword_cooldown.py`：旧冷却状态兼容（接收人隔离、到期、快照保留和延迟复查补位）测试。
+- `test_webhook_delivery.py`：群机器人 Webhook 载荷、`errcode` 判定、超时、节流、45009 重试与 key 脱敏测试。
 - `test_keyword_alerts.py`：关键词配置解析、标题匹配、价格阈值、去重、关键词查询和企业微信载荷/字节上限测试。
 - `keywords.json`：默认关键词低价提醒配置。
 - `test_comment_evidence.py`：等级证据门槛、未知等级和集中度边界测试。

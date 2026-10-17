@@ -30,6 +30,7 @@ class PushDeliveryTests(unittest.TestCase):
         self.patches.enter_context(patch('smzdm.WECOM_CORPID', 'ww_private_corp'))
         self.patches.enter_context(patch('smzdm.WECOM_AGENTID', '1000003'))
         self.patches.enter_context(patch('smzdm.WECOM_SECRET', 'SECRET_private_value'))
+        self.patches.enter_context(patch('smzdm.WECOM_WEBHOOK_URL', ''))
         self.patches.enter_context(patch('smzdm.WECOM_TOUSER', '@all'))
         self.patches.enter_context(patch('smzdm.DRY_RUN', False))
         self.get = self.patches.enter_context(patch('smzdm.requests.get'))
