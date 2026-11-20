@@ -3,12 +3,12 @@ import os
 import tempfile
 import unittest
 from contextlib import ExitStack
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import requests
 
-from smzdm import CONFIG, SmzdmScraper
+from smzdm import CONFIG, SmzdmScraper, format_utc_iso, parse_utc, utc_now
 
 
 class PushKeywordCooldownTests(unittest.TestCase):
@@ -82,7 +82,7 @@ class PushKeywordCooldownTests(unittest.TestCase):
             self.assertFalse(self.scraper._is_push_keyword_cooling_down(self.data['id']))
         self.scraper.conn.execute(
             'UPDATE push_keyword_cooldowns SET expires_at = ?',
-            (datetime.utcnow().isoformat(timespec='seconds'),),
+            (format_utc_iso(),),
         )
         self.assertFalse(self.scraper._is_push_keyword_cooling_down(self.data['id']))
         self.post.return_value.json.return_value = {'errcode': 0, 'errmsg': 'ok', 'msgid': 'MSG1'}
@@ -123,7 +123,7 @@ class PushKeywordCooldownTests(unittest.TestCase):
         self.assertEqual(self.scraper.stats['total_push_failed'], 0)
 
     def test_late_recheck_excludes_cooldown_before_limit_and_backfills_request_budget(self):
-        captured_at = (datetime.utcnow() - timedelta(hours=2)).isoformat(timespec='seconds')
+        captured_at = format_utc_iso(utc_now() - timedelta(hours=2))
         for index in range(20):
             article_id = str(183700000 + index)
             self.scraper.conn.execute(
@@ -149,7 +149,7 @@ class PushKeywordCooldownTests(unittest.TestCase):
         self.scraper._save_push_keyword_cooldown('expired')
         self.scraper.conn.execute(
             'UPDATE push_keyword_cooldowns SET expires_at = ? WHERE article_id = ?',
-            ((datetime.utcnow() - timedelta(seconds=1)).isoformat(timespec='seconds'), 'expired'),
+            (format_utc_iso(utc_now() - timedelta(seconds=1)), 'expired'),
         )
         self.scraper._clean_old_records()
         self.assertEqual(self.scraper.conn.execute(

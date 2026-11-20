@@ -1,6 +1,6 @@
 # AGENTS.md
 
-This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-10-11`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
+This file gives coding agents the repository-specific context needed to change and validate the project. It reflects the code and workflow as of `2026-10-29`. Treat `smzdm.py` and `.github/workflows/smzdm.yml` as the source of truth when they differ from documentation.
 
 ## WeCom Push and Keyword Alerts (2026-10-17)
 
@@ -36,9 +36,12 @@ Run the test suite:
 python3 -m unittest -v
 ```
 
-Optional environment variable:
+Optional environment variables:
 
 - `SMZDM_DB_PATH` changes the SQLite path. The default is `smzdm.db`.
+- `SMZDM_STATE_RESTORED=0` records snapshots and history but does not send deal notifications, including keyword low-price alerts. The workflow sets it only when both the Actions cache and the `smzdm-state` branch are missing. Leave it unset for local runs. Daily heartbeat and workflow failure alerts use WeCom when it is configured; optional WXPusher remains a backup ops channel only.
+- `WXPUSHER_BACKUP_UID` copies a successful primary send, the daily heartbeat, and error alerts to a second recipient. Unset means no backup send.
+- `WXPUSHER_BACKUP_APP_TOKEN` is optional and only needed when that UID belongs to another WXPusher app.
 
 The script performs one scan, sends any accepted deals, and exits. Scheduling belongs to GitHub Actions and cron-job.org; do not add a local loop.
 
@@ -59,6 +62,7 @@ The only runtime dependency is `requests`.
 
 - Main feed: `https://api.smzdm.com/v1/list?limit=100&offset=N`.
 - The main scan reads at most 51 pages, 5100 rows, and six hours of `faxian`/`youhui` items. The live API currently returns no rows beyond offset 5000. At busy times the row cap, not the six-hour cap, determines coverage.
+- Incremental paging may stop before that cap only after the oldest item on the page is at least 3 hours old and two consecutive pages are dominated by article IDs already stored in snapshots or history. A new item with any worthy vote, comment, or enough collections blocks that stop. Unpushed snapshots still inside the 6-hour feed whose latest snapshot is older than 20 minutes also block it, and every second run forces a full scan. Feeds that never reach 3 hours still request all 51 pages. These settings do not change quality thresholds.
 - Ranking supplement: `https://m.smzdm.com/sou/category_rank?page=1&limit=50&hour=N`.
 - Ranking windows rotate through 1, 3, and 12 hours in 15-minute slots. Only one ranking request is made per run, and ranking membership never bypasses normal filters.
 - Bounded late rechecks use `https://haojia-api.smzdm.com/detail/{article_id}` to refresh active status, price, mall, direct product link, and current interaction counts after a candidate has left both discovery feeds.
@@ -202,7 +206,9 @@ The 2026-10-11 comment/API review is recorded in `analysis/smzdm-api-research-20
 
 Manual dispatch has an optional `debug_article_id` input. It validates a numeric ID, initializes/migrates the restored database before diagnostic SQL, and prints matching `candidate_snapshots` plus successful-push history for the same ID, SKU, or fingerprint before the scan. Queue diagnostics use the configured UID so recipient cooldown exclusions match the actual scan. Use this instead of guessing when a specific article is reported missing; leaving it blank has no effect on normal runs.
 
-The workflow uses `concurrency: smzdm-scan`, a 12-minute job timeout, Python 3.11, unit tests before scanning, and `actions/cache` for `smzdm.db`. Cache is not a transactional mutable store: closely spaced or retried runs can restore stale state. Do not claim exactly-once delivery without moving state to a more reliable store.
+The workflow uses `concurrency: smzdm-scan`, a 12-minute job timeout, Python 3.11, unit tests before scanning, pip caching, and `actions/cache` for `smzdm.db`. If the cache misses, it restores `smzdm.db` from the rolling `smzdm-state` branch and publishes that branch again after the run. A cache miss with no branch enters safe mode for that run. `contents: write` lets the default token update the branch; `SMZDM_STATE_TOKEN` is an optional override. Cache and the branch are still not a transactional store: closely spaced or retried runs can restore stale state. Do not claim exactly-once delivery.
+
+One heartbeat is sent per China calendar day. A caught scan exception, or a failed workflow step that the script did not already alert, sends an error notification. Deal filtering thresholds are unchanged. Datetimes used for age, snapshots, and cooldowns are timezone-aware UTC; stored text stays offset-free so older rows keep comparing. Unit tests do not attach the stdout log handler, so expected ERROR logs stay out of the Actions test log. `main` reports unexpected exceptions with `logging.exception`.
 
 ## Change Checklist
 

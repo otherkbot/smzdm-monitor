@@ -1,9 +1,9 @@
 import unittest
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import patch
 
-from smzdm import CONFIG, SmzdmScraper
+from smzdm import CONFIG, SmzdmScraper, format_utc_iso, utc_now
 
 
 class SmzdmFilterTests(unittest.TestCase):
@@ -328,8 +328,8 @@ class SmzdmFilterTests(unittest.TestCase):
             )
             """
         )
-        old = (datetime.utcnow() - timedelta(hours=2)).isoformat(timespec="seconds")
-        recent = datetime.utcnow().isoformat(timespec="seconds")
+        old = format_utc_iso(utc_now() - timedelta(hours=2))
+        recent = format_utc_iso()
         rows = [
             ("1", "刚复查", 6, 8, 0, 22, 2, old),
             ("2", "应复查", 4, 5, 0, 14, 2, old),

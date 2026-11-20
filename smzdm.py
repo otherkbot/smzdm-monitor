@@ -30,6 +30,9 @@ WECOM_TOUSER = os.environ.get("WECOM_TOUSER", "").strip() or "@all"
 WECOM_API_BASE = "https://qyapi.weixin.qq.com/cgi-bin"
 # 企业微信群机器人（消息推送）Webhook；配置后优先走群机器人，不再需要 corpid/secret。
 WECOM_WEBHOOK_URL = os.environ.get("WECOM_WEBHOOK_URL", "").strip()
+# 可选：WXPusher 仅用于备用通道 / 未改走企业微信时的运维心跳。商品主推送仍走企业微信。
+APP_TOKEN = os.environ.get("WXPUSHER_APP_TOKEN", "").strip()
+UID = os.environ.get("WXPUSHER_UID", "").strip()
 # 仅记录将要发送的载荷，不请求企业微信、不写入推送历史
 DRY_RUN = os.environ.get("DRY_RUN", "").strip().lower() in ("1", "true", "yes", "on")
 # 关键词低价提醒：环境变量优先，其次仓库内 keywords.json
@@ -40,11 +43,189 @@ KEYWORDS_FILE = os.environ.get(
 )
 DB_PATH = os.environ.get("SMZDM_DB_PATH", "smzdm.db")
 SMZDM_DETAIL_SIGN_KEY = "apr1$AwP!wRRT$gJ/q.X24poeBInlUJC"
+OPS_ALERT_MARKER = "smzdm-ops-alerted"
+CHINA_TZ = timezone(timedelta(hours=8))
+
+
+def utc_now():
+    """Timezone-aware UTC. Stored strings stay offset-free so old rows still compare."""
+    return datetime.now(timezone.utc)
+
+
+def format_utc_iso(moment=None):
+    """UTC timestamp without offset, matching existing snapshot/cooldown text."""
+    moment = utc_now() if moment is None else moment
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    else:
+        moment = moment.astimezone(timezone.utc)
+    return moment.strftime('%Y-%m-%dT%H:%M:%S')
+
+
+def format_utc_sql(moment=None):
+    """UTC timestamp in SQLite CURRENT_TIMESTAMP form (space separator)."""
+    moment = utc_now() if moment is None else moment
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    else:
+        moment = moment.astimezone(timezone.utc)
+    return moment.strftime('%Y-%m-%d %H:%M:%S')
+
+
+def parse_utc(value):
+    """Parse stored UTC text or a datetime into a timezone-aware UTC instant."""
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        if not value:
+            return utc_now()
+        text = str(value).strip().replace('Z', '+00:00')
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            try:
+                parsed = datetime.strptime(text, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                return utc_now()
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _running_under_unittest():
+    if os.environ.get("SMZDM_UNITTEST") == "1":
+        return True
+    argv0 = sys.argv[0] if sys.argv else ""
+    if "unittest" in argv0.replace("\\", "/"):
+        return True
+    base = os.path.basename(argv0)
+    return base.startswith("test_") and base.endswith(".py")
+
+
+def _safe_mode_from_env():
+    """Workflow sets this only when neither cache nor the state branch had a database."""
+    return os.environ.get("SMZDM_STATE_RESTORED", "").strip().lower() in {"0", "false", "no"}
+
+
+def _redact_secrets(value, limit=180):
+    text = str(value or "")
+    secrets = (
+        APP_TOKEN,
+        UID,
+        WECOM_SECRET,
+        WECOM_WEBHOOK_URL,
+        os.environ.get("WXPUSHER_BACKUP_UID", ""),
+        os.environ.get("WXPUSHER_BACKUP_APP_TOKEN", ""),
+    )
+    for secret in secrets:
+        if secret:
+            text = text.replace(secret, "[已隐藏]")
+    text = re.sub(r'[\r\n\t\x00-\x1f\x7f]', ' ', text)
+    return text[:limit]
+
+
+def _valid_push_uid(uid):
+    return isinstance(uid, str) and bool(uid) and re.search(r'[\s\x00-\x1f\x7f,;]', uid) is None
+
+
+def _backup_channel():
+    """Optional second recipient. Unset or invalid values disable it."""
+    uid = os.environ.get("WXPUSHER_BACKUP_UID", "").strip()
+    token = os.environ.get("WXPUSHER_BACKUP_APP_TOKEN", "").strip() or APP_TOKEN
+    if not _valid_push_uid(uid) or not token:
+        return "", ""
+    if uid == UID and token == APP_TOKEN:
+        return "", ""
+    return token, uid
+
+
+def _wecom_ready():
+    """Primary WeCom channel is configured (webhook or self-built app)."""
+    if WECOM_WEBHOOK_URL:
+        return True
+    return bool(WECOM_CORPID and WECOM_AGENTID and WECOM_SECRET)
+
+
+def _ops_channel_ready():
+    """Heartbeat / failure alerts can go out through WeCom or optional WXPusher."""
+    if _wecom_ready():
+        return True
+    return bool(APP_TOKEN) and _valid_push_uid(UID)
+
+
+def _ops_plain_text(summary, content):
+    body = re.sub(r'<br\s*/?>', '\n', str(content or ''), flags=re.I)
+    body = re.sub(r'<[^>]+>', '', html.unescape(body))
+    body = re.sub(r'\n{3,}', '\n\n', body).strip()
+    parts = [str(summary or '').strip(), body]
+    return '\n'.join(part for part in parts if part)
+
+
+def _post_wecom_ops_message(summary, content):
+    """Send a plain-text ops message through the configured WeCom channel."""
+    if DRY_RUN or not _wecom_ready():
+        return False
+    text = _ops_plain_text(summary, content)[:2000]
+    try:
+        if WECOM_WEBHOOK_URL:
+            response = requests.post(
+                WECOM_WEBHOOK_URL,
+                json={'msgtype': 'text', 'text': {'content': text}},
+                timeout=10,
+            )
+            if response.status_code != 200:
+                return False
+            result = response.json()
+            return isinstance(result, dict) and result.get('errcode') == 0
+        token_resp = requests.get(
+            f'{WECOM_API_BASE}/gettoken',
+            params={'corpid': WECOM_CORPID, 'corpsecret': WECOM_SECRET},
+            timeout=10,
+        )
+        if token_resp.status_code != 200:
+            return False
+        token_data = token_resp.json()
+        token = token_data.get('access_token') if isinstance(token_data, dict) else None
+        if token_data.get('errcode') != 0 or not isinstance(token, str) or not token:
+            return False
+        try:
+            agentid = int(WECOM_AGENTID)
+        except (TypeError, ValueError):
+            agentid = WECOM_AGENTID
+        payload = {
+            'touser': WECOM_TOUSER,
+            'msgtype': 'text',
+            'agentid': agentid,
+            'text': {'content': text},
+        }
+        response = requests.post(
+            f'{WECOM_API_BASE}/message/send',
+            params={'access_token': token},
+            json=payload,
+            timeout=10,
+        )
+        if response.status_code != 200:
+            return False
+        result = response.json()
+        return isinstance(result, dict) and result.get('errcode') == 0
+    except Exception:
+        return False
 
 CONFIG = {
     # 扫描参数
     "max_pages": 51,                    # 接口当前最多提供 5100 条；高峰期 4000 条仅覆盖约 1.5 小时
     "max_history_hours": 6,             # 最多扫描过去多少小时内的数据
+    # 增量翻页不改筛选阈值。升温累计窗口是 180 分钟，所以至少扫到 3 小时；
+    # 更老、仍在 6 小时主列表里的未推送快照一旦超过 20 分钟没刷新，本轮就不提前停。
+    # 另外每 2 次运行强制完整翻到原有上限。高峰期 5100 条往往还不满 3 小时，仍会打满 51 页。
+    "incremental_paging_enabled": True,
+    "incremental_min_pages": 4,
+    "incremental_min_age_hours": 3,
+    "incremental_known_page_streak": 2,
+    "incremental_known_ratio": 0.9,
+    "incremental_snapshot_stale_minutes": 20,
+    "incremental_full_scan_every": 2,
+    "heartbeat_enabled": True,
     "whitelist_channel_types": ["faxian", "youhui"],  # 只保留好价相关频道
     "items_per_page": 100,              # 实测接口上限为 100，减少实时分页漂移和请求次数
     "max_consecutive_page_failures": 3, # 主列表连续失败时结束本轮，交给下一次定时任务重试
@@ -332,11 +513,18 @@ CONFIG = {
 }
 
 # ===== 日志 =====
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[logging.StreamHandler(stream=sys.stdout)]
-)
+# 单元测试会故意走失败分支。不要把这些 ERROR 打到 stdout，否则 Actions 的测试步骤被预期失败刷屏。
+# assertLogs 会临时换掉 handler，所以这里只降低默认级别，不 disable 整个 logging。
+if _running_under_unittest():
+    _root_logger = logging.getLogger()
+    _root_logger.setLevel(logging.CRITICAL)
+    _root_logger.addHandler(logging.NullHandler())
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        handlers=[logging.StreamHandler(stream=sys.stdout)]
+    )
 
 
 def normalize_keyword_text(value):
@@ -525,6 +713,15 @@ class SmzdmScraper:
         self.keyword_pushed_ids = set()
         self.wecom_access_token = ''
         self.wecom_webhook_last_send = None
+        self.safe_mode = False
+        self.stats.update({
+            'total_pages_requested': 0,
+            'total_paging_early_stops': 0,
+            'total_safe_mode_suppressed': 0,
+            'total_backup_push_sent': 0,
+            'total_backup_push_failed': 0,
+            'total_heartbeat_sent': 0,
+        })
 
     def _init_session(self):
         retry = Retry(
@@ -631,6 +828,12 @@ class SmzdmScraper:
             'CREATE INDEX IF NOT EXISTS idx_push_keyword_cooldowns_expiry '
             'ON push_keyword_cooldowns (expires_at)'
         )
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS scan_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+        ''')
         self.conn.commit()
 
     def _ensure_history_columns(self):
@@ -667,7 +870,7 @@ class SmzdmScraper:
         cursor = self.conn.execute("SELECT id FROM history")
         self.seen_ids = {row[0] for row in cursor.fetchall()}
 
-        cutoff = datetime.now() - timedelta(days=CONFIG['fingerprint_dedupe_days'])
+        cutoff = format_utc_sql(utc_now() - timedelta(days=CONFIG['fingerprint_dedupe_days']))
         cursor = self.conn.execute(
             '''
             SELECT fingerprint, MIN(price_value)
@@ -715,6 +918,11 @@ class SmzdmScraper:
         if DRY_RUN:
             logging.info("DRY_RUN 已开启：只记录推送载荷，不请求企业微信，也不写入推送历史")
 
+        self.safe_mode = _safe_mode_from_env()
+        if self.safe_mode:
+            logging.warning(
+                "冷启动保护：没有恢复到既有数据库，本轮写入快照和历史，但不发送商品通知"
+            )
         logging.info("开始扫描...")
         self._clean_old_records()
         if self.keyword_rules:
@@ -809,17 +1017,182 @@ class SmzdmScraper:
                 self.stats['total_duplicates'] += 1
                 continue
 
-            # 推送
-            if self._send_notification(parsed):
-                # 只有推送成功才写入历史；未达标或推送失败的商品下次运行会重新按最新互动数据评估。
-                self._save_history(parsed)
-                self._clear_pending_review(parsed)
-                self.stats['total_sent'] += 1
-                path = parsed.get('quality_path', '未知')
-                self.quality_path_sent_counts[path] = self.quality_path_sent_counts.get(path, 0) + 1
+            self._dispatch_accepted_candidate(parsed)
 
+        if not _running_under_unittest():
+            try:
+                self.maybe_send_daily_heartbeat()
+            except Exception:
+                logging.exception("每日心跳发送失败")
         self._print_statistics()
         self._cleanup()
+
+    def _dispatch_accepted_candidate(self, parsed):
+        """发送已通过筛选的商品。没有旧状态时只落库，避免把在架好价一次打出。"""
+        if self.safe_mode:
+            self.stats['total_safe_mode_suppressed'] = self.stats.get('total_safe_mode_suppressed', 0) + 1
+            logging.warning(
+                f"[冷启动保护跳过推送] {self._candidate_log_context(parsed)} "
+                "没有恢复到既有状态，本条写入历史但未发送"
+            )
+            self._save_history(parsed)
+            self._clear_pending_review(parsed)
+            return
+        if self._send_notification(parsed):
+            # 只有推送成功才写入历史；未达标或推送失败的商品下次运行会重新按最新互动数据评估。
+            self._save_history(parsed)
+            self._clear_pending_review(parsed)
+            self.stats['total_sent'] += 1
+            path = parsed.get('quality_path', '未知')
+            self.quality_path_sent_counts[path] = self.quality_path_sent_counts.get(path, 0) + 1
+
+    def _scan_state_get(self, key):
+        if not hasattr(self, 'conn'):
+            return ''
+        try:
+            row = self.conn.execute(
+                'SELECT value FROM scan_state WHERE key = ?', (key,)
+            ).fetchone()
+        except sqlite3.Error:
+            return ''
+        return '' if row is None or row[0] is None else str(row[0])
+
+    def _scan_state_set(self, key, value):
+        if not hasattr(self, 'conn'):
+            return
+        self.conn.execute(
+            '''INSERT INTO scan_state (key, value) VALUES (?, ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value''',
+            (key, str(value)),
+        )
+        self.conn.commit()
+
+    def _consume_full_scan_slot(self):
+        """每 N 次运行强制完整翻页。没有数据库时不强制，交给已知文章判断。"""
+        every = int(CONFIG.get('incremental_full_scan_every') or 0)
+        if not hasattr(self, 'conn'):
+            return every <= 1
+        try:
+            current = int(self._scan_state_get('scan_generation') or 0)
+        except ValueError:
+            current = 0
+        nxt = current + 1
+        try:
+            self._scan_state_set('scan_generation', nxt)
+        except sqlite3.Error:
+            return True
+        if every <= 1:
+            return True
+        return nxt % every == 0
+
+    def _begin_paging_mode(self):
+        """返回本轮是否允许在 6 小时/51 页上限之前停止。"""
+        force_full = self._consume_full_scan_slot()
+        if not CONFIG.get('incremental_paging_enabled', True):
+            return False
+        if getattr(self, 'safe_mode', False):
+            logging.info("冷启动保护使用完整翻页，以便重建快照")
+            return False
+        if force_full:
+            logging.info("本轮为周期完整翻页，扫描到既有时间上限")
+            return False
+        return True
+
+    def _load_known_article_ids(self):
+        if not hasattr(self, 'conn'):
+            return set()
+        try:
+            rows = self.conn.execute(
+                '''
+                SELECT article_id FROM candidate_snapshots
+                WHERE article_id IS NOT NULL AND article_id != ''
+                UNION
+                SELECT id FROM history
+                WHERE id IS NOT NULL AND id != ''
+                '''
+            )
+        except sqlite3.Error:
+            return set()
+        return {str(row[0]) for row in rows if row[0]}
+
+    def _unknown_item_blocks_early_stop(self, parsed):
+        """没见过、但已经有互动的商品不能被当成“旧页”。零互动不会单独构成推送。"""
+        if self._is_inactive_deal(parsed):
+            return False
+        return (
+            parsed.get('worthy', 0) >= 1
+            or parsed.get('comments', 0) >= 1
+            or parsed.get('collection', 0) >= CONFIG['snapshot_min_collection']
+        )
+
+    def _page_is_known_dominated(self, parsed_items, known_ids):
+        if not parsed_items or not known_ids:
+            return False
+        unknown = [item for item in parsed_items if str(item.get('id') or '') not in known_ids]
+        if not unknown:
+            return True
+        known_ratio = (len(parsed_items) - len(unknown)) / len(parsed_items)
+        if known_ratio < float(CONFIG.get('incremental_known_ratio', 1)):
+            return False
+        return not any(self._unknown_item_blocks_early_stop(item) for item in unknown)
+
+    def _tail_snapshots_need_refresh(self, processed_ids):
+        """3–6 小时内、尚未推送且快照已旧的文章还在主列表决策窗里，不能提前停。"""
+        if not hasattr(self, 'conn'):
+            return False
+        stale_before = format_utc_iso(
+            utc_now() - timedelta(minutes=float(CONFIG.get('incremental_snapshot_stale_minutes', 20)))
+        )
+        min_age = float(CONFIG.get('incremental_min_age_hours', 3))
+        max_age = float(CONFIG.get('max_history_hours', 6))
+        try:
+            rows = self.conn.execute(
+                '''
+                WITH latest AS (
+                    SELECT article_id, MAX(captured_at) AS captured_at
+                    FROM candidate_snapshots
+                    WHERE article_id IS NOT NULL AND article_id != ''
+                    GROUP BY article_id
+                )
+                SELECT snapshots.article_id,
+                       (julianday('now') - julianday(snapshots.captured_at)) * 24
+                         + COALESCE(snapshots.age_hours, 0) AS estimated_age
+                FROM latest
+                JOIN candidate_snapshots AS snapshots
+                  ON snapshots.article_id = latest.article_id
+                 AND snapshots.captured_at = latest.captured_at
+                LEFT JOIN history ON history.id = snapshots.article_id
+                WHERE history.id IS NULL
+                  AND snapshots.captured_at < ?
+                ''',
+                (stale_before,),
+            ).fetchall()
+        except sqlite3.Error:
+            return True
+        processed = {str(value) for value in processed_ids}
+        for article_id, estimated_age in rows:
+            if str(article_id) in processed:
+                continue
+            age = float(estimated_age or 0)
+            if min_age <= age <= max_age:
+                return True
+        return False
+
+    def _should_stop_incremental_paging(self, page, oldest_age_hours, dominated_streak, processed_ids):
+        if page < int(CONFIG.get('incremental_min_pages', 1)):
+            return False
+        if dominated_streak < int(CONFIG.get('incremental_known_page_streak', 2)):
+            return False
+        if oldest_age_hours is None or oldest_age_hours < float(CONFIG.get('incremental_min_age_hours', 3)):
+            return False
+        if self._tail_snapshots_need_refresh(processed_ids):
+            return False
+        return True
+
+    @staticmethod
+    def estimate_list_fetch_seconds(pages, delay_seconds=1.0, http_seconds=0.5):
+        """请求间隔中点 1.0 秒（配置 0.5–1.5）加估计的单页 HTTP 时间。"""
+        return max(0, int(pages)) * (delay_seconds + http_seconds)
 
     def _scan_and_filter_stage1(self):
         """扫描 API 并通过综合评分筛选候选商品"""
@@ -833,11 +1206,15 @@ class SmzdmScraper:
         }
         processed_ids = set()
         consecutive_page_failures = 0
+        known_ids = self._load_known_article_ids()
+        incremental = self._begin_paging_mode()
+        dominated_streak = 0
 
         for page in range(1, CONFIG['max_pages'] + 1):
             if stop_scanning:
                 break
 
+            self.stats['total_pages_requested'] = self.stats.get('total_pages_requested', 0) + 1
             items = self._fetch_page(page)
             if items is None:
                 consecutive_page_failures += 1
@@ -856,6 +1233,8 @@ class SmzdmScraper:
                 break
 
             self.stats['total_fetched'] += len(items)
+            page_parsed = []
+            oldest_age = None
 
             for item in items:
                 parsed = self._parse_item(item)
@@ -867,6 +1246,9 @@ class SmzdmScraper:
                     stop_scanning = True
                     break
 
+                page_parsed.append(parsed)
+                age_hours = parsed.get('age_hours', 0) or 0
+                oldest_age = age_hours if oldest_age is None else max(oldest_age, age_hours)
                 processed_ids.add(parsed['id'])
                 self._observe_keyword_match(parsed)
                 rank_entry = rank_by_id.get(parsed['id'])
@@ -876,6 +1258,23 @@ class SmzdmScraper:
                 self._consider_stage1_candidate(parsed, candidates)
 
             self._commit_candidate_snapshots()
+            if stop_scanning or not page_parsed:
+                dominated_streak = 0
+            elif incremental and self._page_is_known_dominated(page_parsed, known_ids):
+                dominated_streak += 1
+            else:
+                dominated_streak = 0
+
+            if (not stop_scanning and incremental and self._should_stop_incremental_paging(
+                page, oldest_age, dominated_streak, processed_ids,
+            )):
+                stop_scanning = True
+                self.stats['total_paging_early_stops'] = self.stats.get('total_paging_early_stops', 0) + 1
+                logging.info(
+                    f"增量翻页停止: 第{page}页起已连续 {dominated_streak} 页由既有文章主导，"
+                    f"最老约 {oldest_age:.1f} 小时，已覆盖升温窗口。"
+                    f"更老的未推送商品留到下一次完整翻页；筛选阈值未改。"
+                )
             time.sleep(random.uniform(*CONFIG['request_delay']))
 
         discovered_ids = set(processed_ids)
@@ -1058,7 +1457,8 @@ class SmzdmScraper:
     def _select_late_recheck_rows(self, discovered_ids, limit):
         interval_minutes = max(1, int(CONFIG.get('late_recheck_interval_minutes', 45)))
         max_age_hours = max(1, float(CONFIG.get('late_recheck_max_age_hours', 18)))
-        cutoff = datetime.utcnow() - timedelta(minutes=interval_minutes)
+        cutoff = utc_now() - timedelta(minutes=interval_minutes)
+        cutoff_text = format_utc_iso(cutoff)
         pool_limit = max(limit * 5, limit)
         cursor = self.conn.execute(
             '''
@@ -1107,9 +1507,9 @@ class SmzdmScraper:
             ''',
             (
                 self._push_recipient_key(),
-                datetime.utcnow().isoformat(timespec='seconds'),
-                cutoff.isoformat(timespec='seconds'),
-                cutoff.isoformat(timespec='seconds'),
+                format_utc_iso(),
+                cutoff_text,
+                cutoff_text,
                 CONFIG['late_recheck_min_worthy'],
                 CONFIG['late_recheck_min_collection'],
                 CONFIG['early_signal_min_worthy'],
@@ -1169,7 +1569,7 @@ class SmzdmScraper:
             ''',
             (
                 str(article_id),
-                datetime.utcnow().isoformat(timespec='seconds'),
+                format_utc_iso(),
                 1 if retired else 0,
             )
         )
@@ -1323,7 +1723,7 @@ class SmzdmScraper:
             article_time = article_time.replace(tzinfo=china_tz)
             return max(
                 0,
-                (datetime.now(timezone.utc) - article_time).total_seconds() / 3600,
+                (utc_now() - article_time).total_seconds() / 3600,
             )
         return 0
 
@@ -1435,8 +1835,8 @@ class SmzdmScraper:
             ts = int(time_sort)
             if ts > 10000000000:
                 ts = ts / 1000
-            item_time = datetime.fromtimestamp(ts)
-            age_hours = (datetime.now() - item_time).total_seconds() / 3600
+            item_time = datetime.fromtimestamp(ts, timezone.utc)
+            age_hours = (utc_now() - item_time).total_seconds() / 3600
 
         worthy = max(0, int(item.get('article_worthy', 0)))
         unworthy = max(0, int(item.get('article_unworthy', 0)))
@@ -1603,7 +2003,7 @@ class SmzdmScraper:
 
         first = rows[0]
         previous = rows[-1]
-        now = datetime.utcnow()
+        now = utc_now()
         first_time = self._parse_snapshot_time(first[0])
         previous_time = self._parse_snapshot_time(previous[0])
         elapsed_minutes = self._minutes_between(first_time, now)
@@ -1669,19 +2069,7 @@ class SmzdmScraper:
 
     @staticmethod
     def _parse_snapshot_time(value):
-        if not value:
-            return datetime.utcnow()
-        text = str(value).replace('Z', '+00:00')
-        try:
-            parsed = datetime.fromisoformat(text)
-        except ValueError:
-            try:
-                parsed = datetime.strptime(str(value), '%Y-%m-%d %H:%M:%S')
-            except ValueError:
-                return datetime.utcnow()
-        if parsed.tzinfo is not None:
-            parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-        return parsed
+        return parse_utc(value)
 
     @staticmethod
     def _minutes_between(start, end):
@@ -1751,7 +2139,7 @@ class SmzdmScraper:
                 metrics['composite_score'],
                 parsed.get('age_hours', 0),
                 parsed.get('quality_path', ''),
-                datetime.utcnow().isoformat(timespec='seconds'),
+                format_utc_iso(),
             )
         )
         self.pending_snapshot_writes += 1
@@ -3582,6 +3970,16 @@ class SmzdmScraper:
                 f"[关键词命中] {rule['keyword']}≤{rule['max_price']:g} | {parsed['title'][:40]} | "
                 f"{self._candidate_log_context(parsed)} 价格:{parsed.get('price', '-')}"
             )
+            if self.safe_mode:
+                self.stats['total_safe_mode_suppressed'] = self.stats.get('total_safe_mode_suppressed', 0) + 1
+                logging.warning(
+                    f"[冷启动保护跳过推送] 关键词:{rule['keyword']} | {self._candidate_log_context(parsed)} "
+                    "没有恢复到既有状态，本条写入历史但未发送"
+                )
+                self._save_history(parsed)
+                self.keyword_pushed_ids.add(parsed['id'])
+                pushed_prices.add(price_key)
+                continue
             sent = self._send_notification(parsed)
             if sent or DRY_RUN:
                 pushed_prices.add(price_key)
@@ -3612,7 +4010,7 @@ class SmzdmScraper:
         return self.conn.execute(
             '''SELECT 1 FROM push_keyword_cooldowns
                WHERE recipient_key = ? AND article_id = ? AND expires_at > ?''',
-            (recipient_key, article_id, datetime.utcnow().isoformat(timespec='seconds')),
+            (recipient_key, article_id, format_utc_iso()),
         ).fetchone() is not None
 
     def _skip_push_keyword_cooldown(self, data):
@@ -3633,13 +4031,13 @@ class SmzdmScraper:
         article_id = str(article_id or '').strip()
         if not minutes or not recipient_key or not article_id:
             return
-        expires_at = datetime.utcnow() + timedelta(minutes=minutes)
+        expires_at = utc_now() + timedelta(minutes=minutes)
         self.conn.execute(
             '''INSERT INTO push_keyword_cooldowns (recipient_key, article_id, expires_at)
                VALUES (?, ?, ?)
                ON CONFLICT(recipient_key, article_id) DO UPDATE SET
                    expires_at = excluded.expires_at''',
-            (recipient_key, article_id, expires_at.isoformat(timespec='seconds')),
+            (recipient_key, article_id, format_utc_iso(expires_at)),
         )
         self.conn.commit()
 
@@ -3926,6 +4324,7 @@ class SmzdmScraper:
                 f"不值:{data.get('unworthy', 0)} | "
                 f"{delivery_note} msgid:{'有' if record_id else '-'}"
             )
+            self._send_backup_notification(data)
             return True
         except requests.Timeout:
             # POST 超时无法判断服务端是否已发送，不立即重试以免重复通知。
@@ -3934,6 +4333,108 @@ class SmzdmScraper:
             return failed('接口 JSON 无法解析')
         except Exception as e:
             return failed(f'异常类型:{type(e).__name__}')
+
+    def _send_backup_notification(self, data):
+        """主通道成功后再复制一份到可选的 WXPusher 备用接收人。失败不影响历史。"""
+        token, uid = _backup_channel()
+        if not token or not uid:
+            return False
+        title = str(data.get('title') or '')[:40]
+        price = str(data.get('price') or '')
+        summary = f"{price} {title}".strip()[:100]
+        backup_payload = {
+            'appToken': token,
+            'content': summary,
+            'summary': summary,
+            'contentType': 1,
+            'uids': [uid],
+        }
+        try:
+            response = requests.post(
+                'https://wxpusher.zjiecode.com/api/send/message',
+                json=backup_payload,
+                timeout=10,
+            )
+            if response.status_code != 200:
+                raise ValueError(f'HTTP {response.status_code}')
+            result = response.json()
+            if not isinstance(result, dict) or result.get('success') is not True or result.get('code') != 1000:
+                raise ValueError('backup rejected')
+            self.stats['total_backup_push_sent'] = self.stats.get('total_backup_push_sent', 0) + 1
+            logging.info("[备用通道] 已提交发送任务，不写入主接收人历史")
+            return True
+        except Exception as exc:
+            self.stats['total_backup_push_failed'] = self.stats.get('total_backup_push_failed', 0) + 1
+            logging.warning(f"[备用通道失败] {_redact_secrets(type(exc).__name__)}，主推送结果不变")
+            return False
+
+    def maybe_send_daily_heartbeat(self, now=None):
+        """每个北京时间自然日发一条运行摘要，用来区分“没有好价”和“任务没跑”。"""
+        if not CONFIG.get('heartbeat_enabled', True):
+            return False
+        if not _ops_channel_ready():
+            return False
+        moment = utc_now() if now is None else now
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=timezone.utc)
+        today = moment.astimezone(CHINA_TZ).date().isoformat()
+        if self._scan_state_get('last_heartbeat_date') == today:
+            return False
+        sent = self.stats.get('total_sent', 0)
+        fetched = self.stats.get('total_fetched', 0)
+        pages = self.stats.get('total_pages_requested', 0)
+        if self.safe_mode:
+            summary = f"SMZDM监控正常 冷启动未推送 扫描{pages}页/{fetched}条"
+        else:
+            summary = f"SMZDM监控正常 扫描{pages}页/{fetched}条 推送{sent}条"
+        history_count = 0
+        snapshot_count = 0
+        if hasattr(self, 'conn'):
+            try:
+                history_count = self.conn.execute('SELECT COUNT(*) FROM history').fetchone()[0]
+                snapshot_count = self.conn.execute('SELECT COUNT(*) FROM candidate_snapshots').fetchone()[0]
+            except sqlite3.Error:
+                pass
+        early = self.stats.get('total_paging_early_stops', 0)
+        backup = '已配置' if _backup_channel()[1] else '未配置'
+        safe_html = (
+            '冷启动保护：本轮符合条件的商品已写入历史，但没有发送。<br>'
+            if self.safe_mode else ''
+        )
+        content = (
+            '<div style="font-size:15px;line-height:1.7;">'
+            '<b>每日心跳</b><br>'
+            f'{safe_html}'
+            f'北京时间 {html.escape(today)}，主列表请求 {int(pages)} 页、读取 {int(fetched)} 条，'
+            f'本轮推送 {int(sent)} 条。<br>'
+            f'历史去重 {int(history_count)} 条，候选快照 {int(snapshot_count)} 条，'
+            f'增量提前停止 {int(early)} 次，备用通道{html.escape(backup)}。<br>'
+            '这条消息每天最多一条，用来区分静默与故障。商品筛选阈值没有变化。'
+            '</div>'
+        )
+        if not _post_ops_message(summary[:100], content):
+            return False
+        self._scan_state_set('last_heartbeat_date', today)
+        self.stats['total_heartbeat_sent'] = self.stats.get('total_heartbeat_sent', 0) + 1
+        logging.info(f"[每日心跳] {summary[:100]}")
+        return True
+
+    def send_error_alert(self, exc=None):
+        """运行异常时通知一次。正文不带密钥，也不把告警失败变成新的异常。"""
+        kind = type(exc).__name__ if exc is not None else 'Exception'
+        detail = _redact_secrets(exc) if exc is not None else ''
+        content = (
+            '<div style="font-size:15px;line-height:1.7;">'
+            '<b>监控运行异常</b><br>'
+            f'类型：{html.escape(kind)}<br>'
+            f'摘要：{html.escape(detail or "无")}<br>'
+            '请查看 GitHub Actions 日志。这条消息只说明本轮失败，不代表商品被漏推或已送达。'
+            '</div>'
+        )
+        sent = _post_ops_message('SMZDM监控运行异常', content, mark_alert=True)
+        if sent:
+            logging.info("[错误告警] 已提交")
+        return sent
 
     @staticmethod
     def _notification_plain_text(value):
@@ -4383,28 +4884,28 @@ class SmzdmScraper:
             logging.error(f"保存历史失败: {e}")
 
     def _clean_old_records(self):
-        cutoff = datetime.now() - timedelta(days=30)
+        cutoff = format_utc_sql(utc_now() - timedelta(days=30))
         cursor = self.conn.execute("DELETE FROM history WHERE last_seen < ?", (cutoff,))
         deleted = cursor.rowcount
 
-        pending_cutoff = datetime.now() - timedelta(days=CONFIG['pending_review_keep_days'])
+        pending_cutoff = format_utc_sql(utc_now() - timedelta(days=CONFIG['pending_review_keep_days']))
         pending_cursor = self.conn.execute("DELETE FROM pending_reviews WHERE last_seen < ?", (pending_cutoff,))
         pending_deleted = pending_cursor.rowcount
 
-        snapshot_cutoff = datetime.utcnow() - timedelta(days=CONFIG['snapshot_keep_days'])
+        snapshot_cutoff = format_utc_iso(utc_now() - timedelta(days=CONFIG['snapshot_keep_days']))
         snapshot_cursor = self.conn.execute(
             "DELETE FROM candidate_snapshots WHERE captured_at < ?",
-            (snapshot_cutoff.isoformat(timespec='seconds'),)
+            (snapshot_cutoff,)
         )
         snapshot_deleted = snapshot_cursor.rowcount
         recheck_cursor = self.conn.execute(
             "DELETE FROM late_recheck_state WHERE last_checked < ?",
-            (snapshot_cutoff.isoformat(timespec='seconds'),)
+            (snapshot_cutoff,)
         )
         recheck_deleted = recheck_cursor.rowcount
         cooldown_cursor = self.conn.execute(
             'DELETE FROM push_keyword_cooldowns WHERE expires_at <= ?',
-            (datetime.utcnow().isoformat(timespec='seconds'),),
+            (format_utc_iso(),),
         )
         cooldown_deleted = cooldown_cursor.rowcount
 
@@ -4449,6 +4950,8 @@ class SmzdmScraper:
         logging.info(f"  相似商品重复: {self.stats['total_fingerprint_duplicates']}")
         logging.info(f"  标题正则过滤: {self.stats['total_filtered_title_pattern']}")
         logging.info(f"  综合评分过滤: {self.stats['total_filtered_stage1']}")
+        logging.info(f"  主列表请求页数: {self.stats.get('total_pages_requested', 0)}")
+        logging.info(f"  增量翻页提前停止: {self.stats.get('total_paging_early_stops', 0)}")
         logging.info(f"  主列表请求失败页: {self.stats['total_page_request_failures']}")
         logging.info(f"  主列表故障提前结束: {self.stats['total_main_scan_aborted']}")
         if self.quality_path_pass_counts:
@@ -4484,7 +4987,11 @@ class SmzdmScraper:
         logging.info(f"  增长过慢过滤: {self.stats['total_filtered_trend_slow']}")
         logging.info(f"  外部校验熔断: {self.stats['total_external_checks_suspended']}")
         logging.info(f"  成功推送: {self.stats['total_sent']}")
+        logging.info(f"  冷启动保护跳过推送: {self.stats.get('total_safe_mode_suppressed', 0)}")
         logging.info(f"  推送失败: {self.stats['total_push_failed']}")
+        logging.info(f"  备用通道成功: {self.stats.get('total_backup_push_sent', 0)}")
+        logging.info(f"  备用通道失败: {self.stats.get('total_backup_push_failed', 0)}")
+        logging.info(f"  每日心跳: {self.stats.get('total_heartbeat_sent', 0)}")
         logging.info(f"    POST 超时结果未知: {self.stats['total_push_unknown']}")
         logging.info(f"  DRY_RUN 未发送载荷: {self.stats['total_push_dry_run']}")
         logging.info(f"  关键词查询请求: {self.stats['total_keyword_searches']}（失败 {self.stats['total_keyword_search_failed']}）")
@@ -4512,14 +5019,82 @@ class SmzdmScraper:
             self.session.close()
 
 
+def _ops_targets():
+    targets = []
+    if APP_TOKEN and _valid_push_uid(UID):
+        targets.append((APP_TOKEN, UID))
+    token, uid = _backup_channel()
+    if token and uid:
+        targets.append((token, uid))
+    return targets
+
+
+def _post_ops_message(summary, content, mark_alert=False):
+    """运维消息。优先企业微信，其次可选 WXPusher。未配置接收人时直接跳过。"""
+    targets = _ops_targets()
+    sent = False
+    if _wecom_ready() and not DRY_RUN:
+        sent = _post_wecom_ops_message(summary, content) or sent
+    if not targets and not sent:
+        logging.info("运维消息未发送：没有可用的企业微信或 WXPusher 接收人")
+        return False
+    for token, uid in targets:
+        payload = {
+            'appToken': token,
+            'content': content,
+            'summary': summary[:100],
+            'contentType': 2,
+            'uids': [uid],
+        }
+        try:
+            response = requests.post(
+                'https://wxpusher.zjiecode.com/api/send/message',
+                json=payload,
+                timeout=10,
+            )
+            if response.status_code != 200:
+                continue
+            result = response.json()
+            if isinstance(result, dict) and result.get('success') is True and result.get('code') == 1000:
+                sent = True
+        except Exception as exc:
+            logging.warning(f"运维消息发送失败: {_redact_secrets(type(exc).__name__)}")
+    if sent and mark_alert:
+        try:
+            with open(OPS_ALERT_MARKER, 'w', encoding='utf-8') as handle:
+                handle.write('1\n')
+        except OSError:
+            pass
+    return sent
+
+
+def send_workflow_failure_alert(reason='GitHub Actions 运行失败'):
+    """供工作流在脚本之外的失败步骤调用。脚本自己已经告警过则不再发。"""
+    if os.path.exists(OPS_ALERT_MARKER):
+        return False
+    detail = _redact_secrets(reason)
+    content = (
+        '<div style="font-size:15px;line-height:1.7;">'
+        '<b>监控运行失败</b><br>'
+        f'{html.escape(detail)}<br>'
+        '请查看 GitHub Actions 日志。'
+        '</div>'
+    )
+    return _post_ops_message('SMZDM监控运行异常', content, mark_alert=True)
+
+
 def main():
     scraper = SmzdmScraper()
     try:
         scraper.run()
     except KeyboardInterrupt:
         logging.warning("用户终止")
-    except Exception as e:
-        logging.error(f"运行异常: {e}")
+    except Exception as exc:
+        logging.exception("运行异常")
+        try:
+            scraper.send_error_alert(exc)
+        except Exception:
+            logging.exception("错误告警发送失败")
         sys.exit(1)
     finally:
         scraper._cleanup()

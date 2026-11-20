@@ -1,8 +1,8 @@
 import unittest
-from datetime import datetime, timedelta
+from datetime import timedelta
 from unittest.mock import patch
 
-from smzdm import SmzdmScraper
+from smzdm import SmzdmScraper, format_utc_iso, utc_now
 
 
 class ArticleTrendAndTitleTests(unittest.TestCase):
@@ -37,9 +37,7 @@ class ArticleTrendAndTitleTests(unittest.TestCase):
         return parsed
 
     def insert_snapshot(self, parsed, minutes_ago=30, item_key=None):
-        captured_at = (datetime.utcnow() - timedelta(minutes=minutes_ago)).isoformat(
-            timespec="seconds"
-        )
+        captured_at = format_utc_iso(utc_now() - timedelta(minutes=minutes_ago))
         self.scraper.conn.execute(
             """
             INSERT INTO candidate_snapshots (

@@ -11,6 +11,9 @@ on:
   repository_dispatch:
     types: [cron_trigger]
 
+permissions:
+  contents: write
+
 concurrency:
   group: smzdm-scan
   cancel-in-progress: false
@@ -21,19 +24,29 @@ jobs:
     timeout-minutes: 12
     steps:
       - uses: actions/checkout@v5
+        with:
+          persist-credentials: true
+          fetch-depth: 1
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
+          cache: pip
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
       - name: Run unit tests
+        env:
+          SMZDM_UNITTEST: '1'
         run: python -m unittest -v
 
-      # 从缓存恢复 SQLite 数据库
+      - name: Remove files created by unit tests
+        if: always()
+        run: rm -f smzdm.db smzdm-ops-alerted
+
+      # 从缓存恢复 SQLite 数据库。key 含 run_id，实际命中靠 restore-keys 前缀。
       - name: Restore database cache
         id: cache-db
         uses: actions/cache/restore@v5
@@ -42,6 +55,47 @@ jobs:
           key: smzdm-db-${{ github.run_id }}
           restore-keys: |
             smzdm-db-
+
+      # 缓存被逐出时，从只保存数据库的 smzdm-state 分支恢复。两者都没有则本轮只建库不推送。
+      - name: Restore durable database
+        id: durable-db
+        run: |
+          set -euo pipefail
+          if [[ -s smzdm.db ]]; then
+            echo "source=cache" >> "$GITHUB_OUTPUT"
+            echo "SMZDM_STATE_RESTORED=1" >> "$GITHUB_ENV"
+            echo "Restored smzdm.db from Actions cache"
+            exit 0
+          fi
+          restored=0
+          if git fetch --depth=1 origin smzdm-state; then
+            if git cat-file -e FETCH_HEAD:smzdm.db; then
+              git show FETCH_HEAD:smzdm.db > smzdm.db
+              if python - <<'PY'
+          import sqlite3
+          import sys
+          conn = sqlite3.connect("smzdm.db")
+          row = conn.execute("PRAGMA integrity_check").fetchone()
+          conn.close()
+          sys.exit(0 if row and row[0] == "ok" else 1)
+          PY
+              then
+                restored=1
+              else
+                echo "smzdm-state database failed integrity check"
+                rm -f smzdm.db
+              fi
+            fi
+          fi
+          if [[ "$restored" == "1" ]]; then
+            echo "source=branch" >> "$GITHUB_OUTPUT"
+            echo "SMZDM_STATE_RESTORED=1" >> "$GITHUB_ENV"
+            echo "Restored smzdm.db from smzdm-state"
+          else
+            echo "source=none" >> "$GITHUB_OUTPUT"
+            echo "SMZDM_STATE_RESTORED=0" >> "$GITHUB_ENV"
+            echo "No prior database. This run records state and does not push."
+          fi
 
       - name: Diagnose requested article
         if: ${{ inputs.debug_article_id != '' }}
@@ -136,12 +190,84 @@ jobs:
           # 留空则使用仓库内 keywords.json；格式：好奇号:155,京东plus会员|京东plus年卡:80
           SMZDM_KEYWORDS: ${{ vars.SMZDM_KEYWORDS }}
           DRY_RUN: ${{ vars.DRY_RUN }}
+          # 可选：若仍配置了 WXPusher，可用于运维心跳/备用通道；商品主推送走企业微信
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          WXPUSHER_BACKUP_UID: ${{ secrets.WXPUSHER_BACKUP_UID }}
+          WXPUSHER_BACKUP_APP_TOKEN: ${{ secrets.WXPUSHER_BACKUP_APP_TOKEN }}
         run: python smzdm.py
 
       # 保存 SQLite 数据库到缓存 (无论成功失败都保存，以便保留进度)
       - name: Save database cache
-        if: always()
+        if: always() && hashFiles('smzdm.db') != ''
         uses: actions/cache/save@v5
         with:
           path: smzdm.db
           key: smzdm-db-${{ github.run_id }}
+
+      # 专用分支只保留最新一份数据库，避免每 15 分钟把二进制历史堆进主分支。
+      - name: Publish durable database
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SMZDM_STATE_TOKEN: ${{ secrets.SMZDM_STATE_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ ! -s smzdm.db ]]; then
+            echo "No database file to publish"
+            exit 0
+          fi
+          python - <<'PY'
+          import sqlite3
+          conn = sqlite3.connect("smzdm.db")
+          row = conn.execute("PRAGMA integrity_check").fetchone()
+          conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+          conn.commit()
+          conn.close()
+          if not row or row[0] != "ok":
+              raise SystemExit("refusing to publish a database that failed integrity_check")
+          PY
+          export TOKEN="${SMZDM_STATE_TOKEN:-${GITHUB_TOKEN:-}}"
+          if [[ -z "$TOKEN" ]]; then
+            echo "No token available to publish smzdm-state"
+            exit 1
+          fi
+          work=$(mktemp -d)
+          askpass=$(mktemp)
+          cleanup() {
+            rm -rf "$work"
+            rm -f "$askpass"
+          }
+          trap cleanup EXIT
+          cp smzdm.db "$work/smzdm.db"
+          git -C "$work" init -b smzdm-state
+          git -C "$work" add smzdm.db
+          git -C "$work" \
+            -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            -c user.name="github-actions[bot]" \
+            commit -m "Update SMZDM monitor state"
+          cat > "$askpass" <<'EOF'
+          #!/bin/sh
+          case "$1" in
+            *[Uu]sername*) printf '%s\n' "x-access-token" ;;
+            *) printf '%s\n' "$TOKEN" ;;
+          esac
+          EOF
+          chmod 700 "$askpass"
+          GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+            git -C "$work" push --force \
+            "https://github.com/${GITHUB_REPOSITORY}.git" HEAD:smzdm-state
+
+      - name: Alert on workflow failure
+        if: failure()
+        env:
+          WECOM_CORPID: ${{ secrets.WECOM_CORPID }}
+          WECOM_AGENTID: ${{ secrets.WECOM_AGENTID }}
+          WECOM_SECRET: ${{ secrets.WECOM_SECRET }}
+          WECOM_TOUSER: ${{ vars.WECOM_TOUSER || '@all' }}
+          WECOM_WEBHOOK_URL: ${{ secrets.WECOM_WEBHOOK_URL }}
+          WXPUSHER_APP_TOKEN: ${{ secrets.WXPUSHER_APP_TOKEN }}
+          WXPUSHER_UID: ${{ secrets.WXPUSHER_UID }}
+          WXPUSHER_BACKUP_UID: ${{ secrets.WXPUSHER_BACKUP_UID }}
+          WXPUSHER_BACKUP_APP_TOKEN: ${{ secrets.WXPUSHER_BACKUP_APP_TOKEN }}
+        run: python -c "from smzdm import send_workflow_failure_alert; send_workflow_failure_alert('GitHub Actions 步骤失败')"
