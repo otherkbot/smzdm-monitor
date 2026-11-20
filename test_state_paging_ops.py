@@ -12,6 +12,7 @@ from smzdm import (
     CONFIG,
     OPS_ALERT_MARKER,
     SmzdmScraper,
+    _keyword_rule,
     format_utc_iso,
     format_utc_sql,
     main,
@@ -271,6 +272,7 @@ class StatePagingAndOpsTests(unittest.TestCase):
                 patch('smzdm.WECOM_WEBHOOK_URL', 'https://example.invalid/wecom-hook'), \
                 patch('smzdm.requests.post') as post, \
                 patch.object(self.scraper, '_scan_and_filter_stage1', return_value=[candidate]), \
+                patch.object(self.scraper, '_search_keyword_deals'), \
                 patch.object(self.scraper, '_enrich_candidates_from_channel_apis'), \
                 patch.object(self.scraper, '_cleanup'), \
                 patch.object(self.scraper, '_print_statistics'), \
@@ -294,6 +296,67 @@ class StatePagingAndOpsTests(unittest.TestCase):
         self.assertEqual(row[0], 'safe-1')
         self.assertEqual(row[1], 19.9)
         self.assertFalse(row[2])
+
+    def test_safe_mode_run_counts_keyword_and_quality_hits_separately(self):
+        # 同一轮冷启动里，热度候选和关键词候选应各计一次跳过，且都不发推送。
+        # 关键词搜索必须打桩，避免单测依赖外部列表接口。
+        quality = {
+            'id': 'safe-1',
+            'title': '小米 智能插座3',
+            'fingerprint': 'safe-socket',
+            'mall': '京东',
+            'price': '19.9元',
+            'price_value': 19.9,
+            'worthy': 25,
+            'unworthy': 0,
+            'collection': 15,
+            'comments': 30,
+            'quality_path': '超级好价',
+        }
+        rule = _keyword_rule('好奇号', 155)
+        keyword = {
+            'id': 'kw-safe-2',
+            'title': '《好奇号》杂志 1年12期',
+            'fingerprint': 'haoqihao-safe',
+            'mall': '当当',
+            'price': '149元',
+            'price_value': 149,
+            'keyword_rule': rule,
+        }
+
+        def fake_search():
+            self.scraper.keyword_candidates[keyword['id']] = dict(keyword)
+
+        with patch.dict(os.environ, {'SMZDM_STATE_RESTORED': '0'}), \
+                patch('smzdm.WECOM_WEBHOOK_URL', 'https://example.invalid/wecom-hook'), \
+                patch('smzdm.requests.post') as post, \
+                patch.object(self.scraper, '_scan_and_filter_stage1', return_value=[quality]), \
+                patch.object(self.scraper, '_search_keyword_deals', side_effect=fake_search), \
+                patch.object(self.scraper, '_enrich_candidates_from_channel_apis'), \
+                patch.object(self.scraper, '_cleanup'), \
+                patch.object(self.scraper, '_print_statistics'), \
+                patch.object(self.scraper, '_prioritize_candidates', side_effect=lambda rows: rows), \
+                patch.object(self.scraper, '_should_defer_for_comment_unavailable', return_value=False), \
+                patch.object(self.scraper, '_is_slow_growth_candidate', return_value=False), \
+                patch.object(self.scraper, '_should_wait_for_trend_confirmation', return_value=False), \
+                patch.object(self.scraper, '_is_low_growth_candidate', return_value=False), \
+                patch.dict(CONFIG, {
+                    'jd_self_filter_enabled': False,
+                    'comment_level_check_enabled': False,
+                    'shill_detection_enabled': False,
+                }):
+            self.scraper.run()
+        post.assert_not_called()
+        self.assertEqual(self.scraper.stats['total_sent'], 0)
+        self.assertEqual(self.scraper.stats['total_keyword_sent'], 0)
+        self.assertEqual(self.scraper.stats['total_safe_mode_suppressed'], 2)
+        rows = self.scraper.conn.execute(
+            'SELECT id, price_value, send_record_id FROM history ORDER BY id'
+        ).fetchall()
+        self.assertEqual([(row[0], row[1], bool(row[2])) for row in rows], [
+            ('kw-safe-2', 149, False),
+            ('safe-1', 19.9, False),
+        ])
 
     def test_daily_heartbeat_is_once_per_china_day_and_backup_is_optional(self):
         accepted = {'success': True, 'code': 1000, 'data': []}
