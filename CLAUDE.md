@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-10-11`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
+This file provides repository guidance to Claude Code. It reflects the implementation as of `2026-10-29`. `AGENTS.md` contains the complete engineering guide; keep both files aligned when application behavior changes.
 
 ## WeCom Push and Keyword Alerts (2026-10-17)
 
@@ -29,12 +29,12 @@ DRY_RUN=1 SMZDM_DB_PATH=/tmp/dry.db python3 smzdm.py  # log payloads only
 python3 -m unittest -v
 ```
 
-`SMZDM_DB_PATH` optionally overrides the default `smzdm.db` path. The sole runtime dependency is `requests`.
+`SMZDM_DB_PATH` optionally overrides the default `smzdm.db` path. `SMZDM_STATE_RESTORED=0` writes the database and suppresses deal pushes for that run. `WXPUSHER_BACKUP_UID` is an optional second recipient; `WXPUSHER_BACKUP_APP_TOKEN` is optional with it. Runtime dependencies are pinned in `requirements.txt` (`requests` and its transitive packages).
 
 ## Inputs and Scan Scope
 
 - Main source: `https://api.smzdm.com/v1/list?limit=100&offset=N`.
-- Scan cap: 51 pages, 5100 rows, six hours, and only `faxian`/`youhui` channels. At peak volume the API row cap is reached before the time cap.
+- Scan cap: 51 pages, 5100 rows, six hours, and only `faxian`/`youhui` channels. At peak volume the API row cap is reached before the time cap. Incremental paging can stop once the page is at least 3 hours old and previously seen articles dominate, unless a stale unpushed tail still sits inside 6 hours or this is the periodic full scan. It does not change quality thresholds, and a feed younger than 3 hours still uses all 51 pages.
 - Ranking source: one request per run to `https://m.smzdm.com/sou/category_rank`, returning up to 50 rows while 1-hour, 3-hour, and 12-hour windows rotate every 15 minutes. Ranking items still pass all normal filters.
 - Late-detail source: 4–16 signed JSON requests per run to `https://haojia-api.smzdm.com/detail/{article_id}`, scaled at 4% of the eligible backlog. It refreshes previously near-threshold, unsent candidates after they leave the feeds, with an 18-hour horizon and a 45-minute per-article interval. Current-feed/rank IDs are excluded.
 - `faxian/list` and `youhui/list` enrich `article_link`, `mall_no`, and `product_no` when present.
@@ -134,7 +134,7 @@ GET retries set `respect_retry_after_header=False`; do not let a 429 Retry-After
 
 Do not add send-status polling: the documented query endpoint returned disabled in a 2026-10-11 read-only check. This does not mean the original message failed; accepted tasks still do not prove terminal arrival.
 
-`.github/workflows/smzdm.yml` supports manual and `repository_dispatch` (`cron_trigger`) starts. cron-job.org triggers it every 15 minutes; GitHub schedule is intentionally absent. The job uses Python 3.11, `concurrency: smzdm-scan`, a 12-minute timeout, unit tests before scanning, and `actions/cache` for SQLite.
+`.github/workflows/smzdm.yml` supports manual and `repository_dispatch` (`cron_trigger`) starts. cron-job.org triggers it every 15 minutes; GitHub schedule is intentionally absent. The job uses Python 3.11, `concurrency: smzdm-scan`, a 12-minute timeout, unit tests before scanning, pip caching, and `actions/cache` for SQLite. A cache miss restores the database from the rolling `smzdm-state` branch. If both are missing, that run records state and does not push. One heartbeat per China calendar day, plus an error alert when a run fails, separates silence from breakage.
 
 Keep the 15-minute cadence based on the 2026-10-10 review: recent runs averaged about four minutes, 72/100 reached the row cap, and early signals benefit from timely repeat observations. Hosted-runner startup failures recover on the next scheduled run; do not add immediate redispatches without new evidence. See `analysis/smzdm-review-2026-10-10.md` for the dated pre-fix review.
 
@@ -142,7 +142,7 @@ See `analysis/smzdm-api-research-2026-10-11.md` for the current comment/API rese
 
 Manual runs accept optional `debug_article_id`; the workflow initializes/migrates the restored database before printing that article's candidate snapshots, matching successful-push history, and late-recheck queue position. Queue diagnostics use the configured UID so recipient cooldown exclusions match the scan. Use it to investigate missing items from real stored metrics.
 
-`actions/cache` is not transactional state. Closely spaced or retried runs may restore an older database, so the current system cannot promise exactly-once notifications.
+`actions/cache` is not transactional state. The `smzdm-state` branch keeps the latest database if the cache is evicted, but closely spaced or retried runs may still restore an older copy, so the current system cannot promise exactly-once notifications.
 
 ## Change Discipline
 
@@ -150,4 +150,6 @@ Manual runs accept optional `debug_article_id`; the workflow initializes/migrate
 - Preserve bounded external traffic and graceful degradation when optional sources fail.
 - Add focused tests for new title variants, parsing assumptions, trends, and dedup behavior.
 - Run `python3 -m unittest -v` and `git diff --check` before committing.
+- Keep stored timestamps offset-free UTC. Compute instants with timezone-aware UTC.
+- Do not let unit tests emit expected ERROR records to stdout. Unexpected failures in `main` use `logging.exception`.
 - Update `README.md`, `AGENTS.md`, and this file together when thresholds, sources, scheduling, or notification behavior changes.

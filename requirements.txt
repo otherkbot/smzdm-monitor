@@ -1,1 +1,6 @@
-requests
+# Pinned 2026-10-29 from a clean `pip install requests` resolution.
+requests==2.34.2
+urllib3==2.8.0
+charset-normalizer==3.5.2
+idna==3.20
+certifi==2026.10.23

@@ -1,4 +1,5 @@
 smzdm.db
+smzdm-ops-alerted
 smzdm_old_optimized.db
 *.log
 __pycache__/
